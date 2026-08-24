@@ -15,5 +15,10 @@ __pycache__/
 next_stage/**/runs/
 backup/
 prompt_cache/
+certs/ca/
+certs/server/
+certs/clients/
+*.key
+*.pem
 
 third_party/CosyVoice/
