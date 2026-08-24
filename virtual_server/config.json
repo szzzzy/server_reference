@@ -1,0 +1,67 @@
+{
+  "server": {
+    "addr": "auto"
+  },
+  "mqtt": {
+    "host": "127.0.0.1",
+    "port": 1883,
+    "enable_local_broker": true,
+    "enable_tls": false,
+    "tls_port": 8883,
+    "username": "",
+    "password": "",
+    "server_client_id": "virtual-server"
+  },
+  "wss": {
+    "host": "0.0.0.0",
+    "port": 9443,
+    "path": "/voice",
+    "token": "julia-test-token-2026",
+    "tls": true
+  },
+  "file_server": {
+    "host": "0.0.0.0",
+    "port": 8443,
+    "tls": true,
+    "root": "releases/files"
+  },
+  "voice": {
+    "mode": "stub",
+    "downlink_rate": 24000,
+    "real": {
+      "models": {
+        "asr": "models/paraformer-zh-streaming",
+        "llm": "models/Qwen3-4B-Instruct-2507",
+        "tts": "models/CosyVoice2-0.5B"
+      },
+      "base_config": "next_stage/voice_sleep_v5_5090/config.json",
+      "system_prompt": "",
+      "history_turns": 0,
+      "max_new_tokens": 180,
+      "vad": {
+        "background_dbfs": -60,
+        "start_above_db": 25,
+        "end_above_db": 25,
+        "endpoint_ms": 1000,
+        "max_seconds": 15,
+        "active_penalty": 4.0
+      }
+    }
+  },
+  "paths": {
+    "server_cert": "../certs/server/server.crt",
+    "server_key": "../certs/server/server.key",
+    "manifest": "releases/manifest.json"
+  },
+  "topics": {
+    "ota_check": "/device/ota/check",
+    "ota_response": "/device/ota/response",
+    "ota_notify": "/device/ota/notify",
+    "ota_status": "/device/ota/status",
+    "audio_check": "/device/audio/check",
+    "audio_response": "/device/audio/response",
+    "audio_status": "/device/audio/status",
+    "vcmd": "voice/esp32s3/vcmd",
+    "vstatus": "voice/esp32s3/vstatus"
+  }
+}

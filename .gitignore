@@ -15,6 +15,11 @@ __pycache__/
 next_stage/**/runs/
 backup/
 prompt_cache/
+.venv_vs/
+virtual_server/runs/
+virtual_server/sim_data/
+virtual_server/releases/files/
+virtual_server/releases/manifest.json
 certs/ca/
 certs/server/
 certs/clients/

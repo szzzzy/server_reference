@@ -1,0 +1,18 @@
+@echo off
+setlocal
+set "PROJECT="
+for /d %%D in ("%USERPROFILE%\Desktop\vr_test_5090_*") do if exist "%%~fD\.venv_vs\Scripts\python.exe" set "PROJECT=%%~fD"
+if not defined PROJECT if exist "%~dp0.venv_vs\Scripts\python.exe" set "PROJECT=%~dp0"
+if not defined PROJECT (
+  echo ERROR: Cannot find vr_test_5090 project with .venv_vs on Desktop.
+  pause
+  exit /b 1
+)
+if not exist "%PROJECT%\virtual_server\releases\manifest.json" (
+  echo [first run] Generating test artifacts ^(firmware + audio + manifest^)...
+  "%PROJECT%\.venv_vs\Scripts\python.exe" "%PROJECT%\virtual_server\make_test_artifacts.py"
+)
+echo Starting virtual server: MQTT broker + HTTPS file + WSS voice + MQTT control...
+echo Ctrl+C to stop. Type vcmd text + Enter to send (add --tty).
+"%PROJECT%\.venv_vs\Scripts\python.exe" "%PROJECT%\virtual_server\run_server.py" %*
+pause
