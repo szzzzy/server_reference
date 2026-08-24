@@ -1,0 +1,58 @@
+{
+  "serial": {
+    "port": "COM7",
+    "baud": 921600
+  },
+  "models": {
+    "asr": "models/paraformer-zh-streaming",
+    "llm": "models/Qwen3-4B-Instruct-2507",
+    "tts": "models/CosyVoice2-0.5B"
+  },
+  "conversation": {
+    "system_prompt": "你是博物馆语音导览助手。请使用中文回答，内容准确、自然、适合直接朗读。每次只回答2到3个短句，总长度尽量控制在100个汉字以内，不使用项目符号，不重复用户问题；资料不足时简短说明，不要编造。",
+    "max_new_tokens": 96,
+    "history_turns": 4
+  },
+  "tts": {
+    "role": "museum_female",
+    "reference_manifest": "tts_roles_5090/results/reference_manifest.json",
+    "fallback_reference_wav": "third_party/CosyVoice/asset/zero_shot_prompt.wav",
+    "fallback_reference_text": "希望你以后能够做的比我还好呦。",
+    "play_audio": false,
+    "output": "board_speaker",
+    "board_volume_percent": 100,
+    "stream_chunk_bytes": 1024
+  },
+  "modes": {
+    "quiet": {
+      "name": "安静环境",
+      "start_threshold_db": 3,
+      "end_threshold_db": 5,
+      "start_active_ms": 160,
+      "start_window_ms": 300,
+      "endpoint_silence_ms": 1200,
+      "endpoint_active_penalty": 4,
+      "max_record_seconds": 15
+    },
+    "lab": {
+      "name": "正常实验室",
+      "start_threshold_db": 3,
+      "end_threshold_db": 3,
+      "start_active_ms": 120,
+      "start_window_ms": 300,
+      "endpoint_silence_ms": 1000,
+      "endpoint_active_penalty": 4,
+      "max_record_seconds": 15
+    },
+    "noise": {
+      "name": "竞争人声噪声（推荐0.5米）",
+      "start_threshold_db": 3,
+      "end_threshold_db": 5,
+      "start_active_ms": 160,
+      "start_window_ms": 300,
+      "endpoint_silence_ms": 1200,
+      "endpoint_active_penalty": 4,
+      "max_record_seconds": 15
+    }
+  }
+}

@@ -1,0 +1,10 @@
+requests
+numpy
+soundfile
+librosa
+jiwer
+pandas
+openpyxl
+tqdm
+sounddevice
+pyserial

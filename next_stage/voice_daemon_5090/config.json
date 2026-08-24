@@ -1,0 +1,47 @@
+{
+  "serial": {"port": "auto", "baud": 921600},
+  "models": {
+    "asr": "models/paraformer-zh-streaming",
+    "llm": "models/Qwen3-4B-Instruct-2507",
+    "tts": "models/CosyVoice2-0.5B"
+  },
+  "conversation": {
+    "system_prompt": "你是博物馆语音导览助手。请使用中文回答，内容准确、自然、适合直接朗读。一般介绍请使用4到6个连贯短句，约100到140个汉字，朗读时间约20秒；简单确认类问题可以简短回答。不使用项目符号，不重复用户问题；资料不足时简短说明，不要编造。",
+    "max_new_tokens": 180,
+    "history_turns": 4
+  },
+  "voice_control": {
+    "wake_words": ["你好导游", "你好小游", "小游小游"],
+    "dialog_exit_words": ["退出对话", "结束对话", "返回待机", "停止对话"],
+    "default_mode": "lab",
+    "background_seconds": 3,
+    "wake_listen_seconds": 8,
+    "command_listen_seconds": 6,
+    "wake_endpoint_silence_ms": 500,
+    "dialog_endpoint_silence_ms": 800,
+    "first_tts_segment_chars": 28,
+    "later_tts_segment_chars": 60
+  },
+  "tts": {
+    "role": "museum_female",
+    "reference_manifest": "tts_roles_5090/results/reference_manifest.json",
+    "fallback_reference_wav": "third_party/CosyVoice/asset/zero_shot_prompt.wav",
+    "fallback_reference_text": "希望你以后能够做的比我还好呦。",
+    "play_audio": false,
+    "output": "board_speaker",
+    "board_volume_percent": 100,
+    "stream_chunk_bytes": 1024
+  },
+  "modes": {
+    "lab": {
+      "name": "正常实验室",
+      "start_threshold_db": 3,
+      "end_threshold_db": 3,
+      "start_active_ms": 120,
+      "start_window_ms": 300,
+      "endpoint_silence_ms": 1000,
+      "endpoint_active_penalty": 4,
+      "max_record_seconds": 15
+    }
+  }
+}

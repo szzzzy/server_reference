@@ -1,0 +1,37 @@
+{
+  "reference_text": "欢迎参观博物馆。",
+  "test_texts": [
+    "欢迎来到博物馆，请跟随我的讲解了解这件珍贵文物。",
+    "这件展品反映了当时的社会生活与工艺水平。",
+    "请注意前方台阶，我们可以放慢速度继续参观。"
+  ],
+  "roles": [
+    {
+      "id": "museum_female",
+      "name": "女声博物馆导览",
+      "gender": "female",
+      "age": "young_adult",
+      "intensity": "medium",
+      "style": "warm_clear",
+      "instruction": "请用年轻成年女声，以温和、清晰、自然的博物馆导览语气朗读，音量适中，语速正常。"
+    },
+    {
+      "id": "museum_male",
+      "name": "男声正式讲解",
+      "gender": "male",
+      "age": "adult",
+      "intensity": "medium_strong",
+      "style": "steady_formal",
+      "instruction": "请用成年男声，以稳重、正式、清晰的讲解语气朗读，力度中等偏强，语速略慢。"
+    },
+    {
+      "id": "accessibility_slow",
+      "name": "无障碍慢速讲解",
+      "gender": "female",
+      "age": "adult",
+      "intensity": "medium",
+      "style": "slow_clear",
+      "instruction": "请用成年女声缓慢、清楚地朗读，句间停顿明显，语气耐心，音量适中。"
+    }
+  ]
+}

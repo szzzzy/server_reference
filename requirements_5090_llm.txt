@@ -1,0 +1,14 @@
+transformers>=4.51.0
+accelerate>=1.5.0
+huggingface_hub>=0.30.0
+modelscope>=1.24.0
+funasr>=1.2.6
+sentencepiece
+soundfile
+librosa
+numpy
+pandas
+openpyxl
+psutil
+nvidia-ml-py
+pyserial

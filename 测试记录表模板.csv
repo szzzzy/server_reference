@@ -1,0 +1,7 @@
+测试对象,测试类型,输入,显存加载后(MB),峰值显存(MB),耗时(s),RTF,准确率/错误率,接口形式,是否通过,备注
+Paraformer-online,流式ASR主测,samples/standard_female_voice_16k_mono_16bit.wav,,,,,,,本地模型,待测,人机对话优先
+SenseVoiceSmall,轻量ASR对照,samples/standard_female_voice_16k_mono_16bit.wav,,,,,,,本地模型,待测,非主流式方案
+Qwen3,文本理解与回答,ASR输出文本,,,,,,,HTTP/本地服务,待测,
+CosyVoice2,TTS语音合成,Qwen3回答文本,,,,,,,HTTP/本地服务,待测,
+完整流水线,音频到语音回复,samples/standard_female_voice_16k_mono_16bit.wav,,,,,,,HTTP/本地服务,待测,
+Qwen2-Audio,端到端语音模型对照,固定音频,,,,,,,本地模型/HTTP,后续对照,

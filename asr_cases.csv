@@ -1,0 +1,2 @@
+case_id,type,audio,expected
+long_voice,dictation,samples/standard_female_voice_16k_mono_16bit.wav,现在开始进行标准女声麦克风拾音性能测试

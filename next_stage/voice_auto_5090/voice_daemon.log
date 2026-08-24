@@ -1,0 +1,42 @@
+
+===== FATAL ERROR =====
+Traceback (most recent call last):
+  File "C:\Users\user\Desktop\vr_test_5090_20260819_224201\next_stage\voice_auto_5090\voice_daemon.py", line 374, in <module>
+    main()
+  File "C:\Users\user\Desktop\vr_test_5090_20260819_224201\next_stage\voice_auto_5090\voice_daemon.py", line 360, in main
+    answer(text)
+  File "C:\Users\user\Desktop\vr_test_5090_20260819_224201\next_stage\voice_auto_5090\voice_daemon.py", line 284, in answer
+    tts = rp.tts_stream_to_board(
+          ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\user\Desktop\vr_test_5090_20260819_224201\next_stage\full_pipeline_auto_5090\realtime_pipeline.py", line 253, in tts_stream_to_board
+    board_speaker_chunk(ser, pcm, 24000, min(int(chunk_bytes), 2048))
+  File "C:\Users\user\Desktop\vr_test_5090_20260819_224201\next_stage\full_pipeline_auto_5090\realtime_pipeline.py", line 211, in board_speaker_chunk
+    serial_write_all(ser, b"SPKD" + len(part).to_bytes(4, "little") + part)
+  File "C:\Users\user\Desktop\vr_test_5090_20260819_224201\next_stage\full_pipeline_auto_5090\realtime_pipeline.py", line 191, in serial_write_all
+    written = ser.write(view)
+              ^^^^^^^^^^^^^^^
+  File "C:\Users\user\Desktop\vr_test_5090_20260819_224201\.venv_5090_llm\Lib\site-packages\serial\serialwin32.py", line 317, in write
+    raise SerialException("WriteFile failed ({!r})".format(ctypes.WinError()))
+serial.serialutil.SerialException: WriteFile failed (PermissionError(13, '设备不识别此命令。', None, 22))
+
+
+===== FATAL ERROR =====
+Traceback (most recent call last):
+  File "C:\Users\user\Desktop\vr_test_5090_20260819_224201\next_stage\voice_auto_5090\voice_daemon.py", line 419, in <module>
+    main()
+  File "C:\Users\user\Desktop\vr_test_5090_20260819_224201\next_stage\voice_auto_5090\voice_daemon.py", line 405, in main
+    answer(text)
+  File "C:\Users\user\Desktop\vr_test_5090_20260819_224201\next_stage\voice_auto_5090\voice_daemon.py", line 331, in answer
+    tts = rp.tts_stream_to_board(
+          ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\user\Desktop\vr_test_5090_20260819_224201\next_stage\full_pipeline_auto_5090\realtime_pipeline.py", line 253, in tts_stream_to_board
+    board_speaker_chunk(ser, pcm, 24000, min(int(chunk_bytes), 2048))
+  File "C:\Users\user\Desktop\vr_test_5090_20260819_224201\next_stage\full_pipeline_auto_5090\realtime_pipeline.py", line 211, in board_speaker_chunk
+    serial_write_all(ser, b"SPKD" + len(part).to_bytes(4, "little") + part)
+  File "C:\Users\user\Desktop\vr_test_5090_20260819_224201\next_stage\full_pipeline_auto_5090\realtime_pipeline.py", line 191, in serial_write_all
+    written = ser.write(view)
+              ^^^^^^^^^^^^^^^
+  File "C:\Users\user\Desktop\vr_test_5090_20260819_224201\.venv_5090_llm\Lib\site-packages\serial\serialwin32.py", line 317, in write
+    raise SerialException("WriteFile failed ({!r})".format(ctypes.WinError()))
+serial.serialutil.SerialException: WriteFile failed (PermissionError(13, '设备不识别此命令。', None, 22))
+

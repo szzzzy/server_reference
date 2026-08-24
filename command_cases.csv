@@ -1,0 +1,2 @@
+case_id,command,audio,expected_keyword
+cmd_start,start_intro,samples/standard_female_voice_16k_mono_16bit.wav,开始
