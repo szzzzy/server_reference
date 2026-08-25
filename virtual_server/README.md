@@ -136,3 +136,11 @@ virtual_server\start_virtual_server.cmd
 - 客户端断开后:下行帧被丢弃(合成继续,属正常);
 - 每问独立(history_turns=0);回答风格如需简短,调 `max_new_tokens` 或加 system_prompt;
 - 板卡上传模式(MICS 触发 / MICW 持续)—— 服务器两种都兼容,首条命令差异只是配置。
+
+### 与新版 PROTOCOL.md(设备侧实际实现)的一致性
+
+- **权威协议参考**:项目根 `PROTOCOL.md`(julia-fused-base 实际实现);
+- **本地唤醒词**:设备带本地唤醒词(如"你好小智")→ 设备自触发开麦(MIC_START 等效),**服务器无需主动发 MIC_START**,引擎即收即答;
+- **vcmd(MQTT)命令集**:`FILE_SEND/MIC_START/MIC_STOP/MICW/MICS/SPKV`——**不含 SPKS/SPKE/SPKT**(那些只走 WSS 下行);服务器默认只在 WSS 发语音命令,无冲突;
+- **固件镜像头**:`make_test_artifacts.py` 生成的 app.bin 带 `project_name=julia-ai`(PROTOCOL.md §3.5 要求);
+- 协议自测断言全过(OTA 7/7、Audio 16/16、Voice 7/7 实测)。

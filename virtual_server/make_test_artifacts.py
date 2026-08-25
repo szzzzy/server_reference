@@ -23,7 +23,8 @@ AUDIO_SECONDS = 2.0
 
 def make_firmware(path, version=FW_VERSION, size=FW_SIZE):
     path.parent.mkdir(parents=True, exist_ok=True)
-    header = f"julia-ai\nversion={version}\nproject=julia-ai\n".encode("utf-8")
+    # 镜像头须与固件 OTA 校验一致(PROTOCOL.md §3.5:project_name=julia-ai 等字段)
+    header = f"project_name=julia-ai\nversion={version}\nsecurity_version=1\n".encode("utf-8")
     body = bytearray(header)
     body.extend(b"\xab" * max(0, size - len(body)))
     body = body[:size]
