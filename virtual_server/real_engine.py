@@ -110,6 +110,12 @@ class RealVoiceEngine:
     # ---------------- 主流程(后台线程)----------------
 
     def _run(self):
+        # 控制台可能是 GBK 编码,emoji 等字符会让 print/日志崩掉引擎 → 一律替换不报错
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.reconfigure(errors="replace")
+            except Exception:
+                pass
         try:
             self._load_and_answer_loop()
         except Exception:
