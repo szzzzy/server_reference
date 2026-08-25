@@ -12,7 +12,12 @@ if not exist "%PROJECT%\virtual_server\releases\manifest.json" (
   echo [first run] Generating test artifacts ^(firmware + audio + manifest^)...
   "%PROJECT%\.venv_vs\Scripts\python.exe" "%PROJECT%\virtual_server\make_test_artifacts.py"
 )
+rem --voice-mode real 自动切换 GPU 环境(.venv_5090_llm 才有 torch/transformers)
+set "PYEXE=%PROJECT%\.venv_vs\Scripts\python.exe"
+echo %* | findstr /i "real" >nul && set "PYEXE=%PROJECT%\.venv_5090_llm\Scripts\python.exe"
 echo Starting virtual server: MQTT broker + HTTPS file + WSS voice + MQTT control...
+echo   python: %PYEXE%
+echo   params: %*
 echo Ctrl+C to stop. Type vcmd text + Enter to send (add --tty).
-"%PROJECT%\.venv_vs\Scripts\python.exe" "%PROJECT%\virtual_server\run_server.py" %*
+"%PYEXE%" "%PROJECT%\virtual_server\run_server.py" %*
 pause
