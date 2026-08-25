@@ -423,6 +423,8 @@ def main():
     ap.add_argument("--device-id", default=DEVICE_ID)
     ap.add_argument("--current-version", default="1.0.0")
     ap.add_argument("--need-update", action="store_true", default=True)
+    ap.add_argument("--no-update", action="store_true",
+                    help="OTA 场景断言 update:false(同版本,不触发)")
     ap.add_argument("--current-audio-version", default="unknown")
     ap.add_argument("--need-audio-update", action="store_true", default=True)
     ap.add_argument("--stream-seconds", type=float, default=3.0)
@@ -433,6 +435,8 @@ def main():
     ap.add_argument("--downlink-wait", type=float, default=120.0,
                     help="等待下行应答的秒数")
     args = ap.parse_args()
+    if args.no_update:
+        args.need_update = False
 
     cfg = json.loads((HERE / "config.json").read_text(encoding="utf-8"))
     if cfg["server"]["addr"] == "auto":
