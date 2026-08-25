@@ -29,8 +29,12 @@ class RangeFileHandler(BaseHTTPRequestHandler):
     # ---------------- 实现细节 ----------------
 
     def _serve(self, head_only):
-        if self.path.split("?", 1)[0] == "/__status":
+        path = self.path.split("?", 1)[0]
+        if path == "/__status":
             self._status(head_only)
+            return
+        if path == "/__debug":
+            self._debug_page(head_only)
             return
         root = self.server.root_dir
         rel = self.path.split("?", 1)[0]
@@ -92,6 +96,43 @@ class RangeFileHandler(BaseHTTPRequestHandler):
         body = _json.dumps(fn() if fn else {}, ensure_ascii=False).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body) if not head_only else 0))
+        self.end_headers()
+        if body and not head_only:
+            self.wfile.write(body)
+
+    def _debug_page(self, head_only):
+        """无线联调状态台:浏览器打开 https://<IP>:8443/__debug,每 2 秒自动刷新。"""
+        html = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>虚拟服务器 · 无线联调状态台</title>
+<style>body{font-family:Consolas,monospace;background:#111;color:#0f0;padding:12px}
+h1{font-size:16px} pre{white-space:pre-wrap;word-break:break-all;font-size:12px}
+.tag{color:#0ff}.ok{color:#0f0}.warn{color:#ff0}</style></head>
+<body>
+<h1>虚拟服务器 · 无线联调状态台 <span class="tag">每 2s 自动刷新</span></h1>
+<div id="conn" class="warn">连接中…</div>
+<h1>最近事件</h1><pre id="recent">(空)</pre>
+<h1>设备状态</h1><pre id="hub">(空)</pre>
+<h1>语音引擎</h1><pre id="engine">(空)</pre>
+<script>
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;')}
+async function pull(){
+  try{
+    const r=await fetch('/__status',{cache:'no-store'});
+    const j=await r.json();
+    document.getElementById('conn').innerHTML='<span class="ok">● 在线</span> '+new Date().toLocaleTimeString();
+    const rec=(j.recent||[]).slice(-20).map(e=>'['+e.t+'] '+e.kind+' '+e.device+' : '+esc(e.text)).join('\\n');
+    document.getElementById('recent').textContent=rec||'(空)';
+    document.getElementById('hub').textContent=JSON.stringify(j.hub||{},null,1);
+    document.getElementById('engine').textContent=JSON.stringify(j.engine||{},null,1);
+  }catch(e){document.getElementById('conn').textContent='连接失败: '+e}
+  setTimeout(pull,2000);
+}
+pull();
+</script></body></html>"""
+        body = html.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body) if not head_only else 0))
         self.end_headers()
         if body and not head_only:

@@ -193,8 +193,10 @@ class RealVoiceEngine:
             save_wav(input_wav, samples)
             recognized, first_partial, asr_seconds = recognize(asr, samples)
             recognized = (recognized or "").strip()
+            print(f"[识别] 第{turn}问({asr_seconds:.2f}s): {recognized or '[空]'}", flush=True)
             self._remember(f"Q{turn}: {recognized or '[空]'}")
             if not recognized:
+                print("[识别] 空文本,本轮跳过", flush=True)
                 continue
 
             answered = self._answer_qa(
@@ -265,6 +267,7 @@ class RealVoiceEngine:
 
         response_pieces = []
         seg_index = 0
+        print(f"[LLM] 开始生成回答(第{turn}问): {user_text[:40]}", flush=True)
         for sentence in sentence_chunks(streamer):
             response_pieces.append(sentence)
             seg_index += 1
@@ -276,6 +279,7 @@ class RealVoiceEngine:
                 "id": request_id, "text": sentence, "output_wav": str(wav),
                 "stream_dir": str(stream_dir),
             }, ensure_ascii=False), encoding="utf-8")
+            print(f"[TTS] 段{seg_index}: {sentence[:40]}", flush=True)
             self._stream_tts_segment(queue, request_id, stream_dir)
         thread.join()
 
@@ -330,6 +334,7 @@ class RealVoiceEngine:
                 response.unlink(missing_ok=True)
                 if spoke:
                     self._push_text("SPKE")
+                    print(f"[下行] 段完成 · SPKS {rate}→SPKE · {next_index} 块音频", flush=True)
                 if not data.get("ok"):
                     log.error("TTS 失败: %s", data.get("error"))
                 return data

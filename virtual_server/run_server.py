@@ -27,7 +27,11 @@ log = logging.getLogger("vs.main")
 
 def build_status_fn(hub, engine):
     def _status():
-        out = {"hub": hub.snapshot(), "engine": engine.snapshot()}
+        out = {
+            "hub": hub.snapshot(),
+            "engine": engine.snapshot(),
+            "recent": hub.recent_list(60),
+        }
         try:
             out["manifest"] = json.loads(
                 (HERE / "releases/manifest.json").read_text(encoding="utf-8")

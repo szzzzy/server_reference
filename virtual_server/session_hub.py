@@ -3,6 +3,7 @@
 import logging
 import threading
 import time
+import collections
 
 from common import append_jsonl, iso_now, ts_now
 
@@ -34,6 +35,7 @@ class DeviceSession:
         self.total_audio_bytes_up = 0
         self.total_pcm_frames = 0
         self.voice_seq_errors = 0
+        self._last_push = {}          # 滚动事件去重(状态切换才推送)
 
     def touch(self, ip="", transport=""):
         self.last_seen = ts_now()
@@ -102,6 +104,12 @@ class SessionHub:
         self.events_path = run_dir / "events.jsonl"
         self.devices = {}
         self.lock = threading.Lock()
+        self.recent = collections.deque(maxlen=300)   # 滚动事件(状态台/控制台用)
+
+    def _push_recent(self, kind, device, text):
+        row = {"t": iso_now(), "kind": kind, "device": device, "text": text}
+        self.recent.append(row)
+        log.info("EVENT %s[%s] %s", kind, device, text)
 
     def get(self, device_id):
         with self.lock:
@@ -110,6 +118,7 @@ class SessionHub:
                 dev = DeviceSession(device_id, self.events_path)
                 self.devices[device_id] = dev
                 log.info("设备会话建立: %s", device_id)
+                self._push_recent("session", device_id, "设备会话建立")
             return dev
 
     def touch(self, device_id, ip="", transport=""):
@@ -117,6 +126,50 @@ class SessionHub:
 
     def record(self, device_id, kind, payload):
         self.get(device_id).record_event(kind, payload)
+        # 密度控制:只推送"有意义的变化"(状态切换/错误),进度/重复事件静默
+        if kind == "ota_status":
+            self._push_ota_change(device_id, payload)
+        elif kind == "audio_status":
+            self._push_audio_change(device_id, payload)
+        elif kind == "vstatus":
+            self._push_vstatus_change(device_id, payload)
+        elif kind == "voice_frame":
+            pass    # 帧级事件不进滚动(50/s 太吵),看统计即可
+
+    def _push_ota_change(self, device_id, payload):
+        dev = self.get(device_id)
+        state = payload.get("state", "")
+        last = dev._last_push.get("ota_state")
+        if state == last and payload.get("error_code", "NONE") == "NONE":
+            return
+        dev._last_push["ota_state"] = state
+        text = f"state={state} ver={payload.get('target_version')}"
+        if payload.get("error_code", "NONE") != "NONE":
+            text += f" err={payload.get('error_code')}"
+        self._push_recent("ota", device_id, text)
+
+    def _push_audio_change(self, device_id, payload):
+        dev = self.get(device_id)
+        state = payload.get("state", "")
+        if state == dev._last_push.get("audio_state") and int(payload.get("error_code", 0) or 0) == 0:
+            return
+        dev._last_push["audio_state"] = state
+        text = f"state={state} progress={payload.get('progress')}"
+        if int(payload.get("error_code", 0) or 0) != 0:
+            text += f" err={payload.get('error_code')}"
+        self._push_recent("audio", device_id, text)
+
+    def _push_vstatus_change(self, device_id, payload):
+        dev = self.get(device_id)
+        text = payload.get("text", "").strip()
+        if text == dev._last_push.get("vstatus"):
+            return
+        dev._last_push["vstatus"] = text
+        self._push_recent("vstatus", device_id, text[:80])
+
+    def recent_list(self, limit=60):
+        with self.lock:
+            return list(self.recent)[-limit:]
 
     def snapshot(self):
         with self.lock:
