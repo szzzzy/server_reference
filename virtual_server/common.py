@@ -38,6 +38,19 @@ def resolve_path(config_root, p):
 
 
 def detect_ip():
+    """取"默认路由对应的出口 IPv4"(多网卡/残留旧地址时不选错)。
+    优先 UDP 探测路由(不实际发包),失败则回退 getaddrinfo。"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                return ip
+        finally:
+            s.close()
+    except OSError:
+        pass
     ips = []
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None):
