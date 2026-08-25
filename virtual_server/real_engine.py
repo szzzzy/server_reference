@@ -194,6 +194,7 @@ class RealVoiceEngine:
                 self.stream.reset_input_buffer()
                 continue
 
+            t_endpoint = time.monotonic()   # 计时原点:VAD 判定"说完了"
             turn += 1
             input_wav = audio_dir / f"qa_{turn:03d}_input.wav"
             save_wav(input_wav, samples)
@@ -205,11 +206,14 @@ class RealVoiceEngine:
                 print("[识别] 空文本,本轮跳过", flush=True)
                 continue
 
+            self._endpoint_wall = t_endpoint      # 供 TTS 首块计时
+            self._first_spks_at = None
             answered = self._answer_qa(
                 turn, recognized, tokenizer, llm, streamer_cls=TextIteratorStreamer,
                 sentence_chunks=self._sentence_chunks, queue=queue, tts_dir=tts_dir,
                 tts_base=tts_base, result_csv=result_csv,
                 asr_seconds=asr_seconds, input_wav=str(input_wav),
+                endpoint_wall=t_endpoint,
             )
             self.last_result = answered
             self.stream.reset_input_buffer()   # 丢弃回合间残留的补静音帧
@@ -255,7 +259,7 @@ class RealVoiceEngine:
 
     def _answer_qa(self, turn, user_text, tokenizer, llm, streamer_cls,
                    sentence_chunks, queue, tts_dir, tts_base, result_csv,
-                   asr_seconds, input_wav):
+                   asr_seconds, input_wav, endpoint_wall):
         import torch
         from datetime import datetime as _dt
 
@@ -274,9 +278,15 @@ class RealVoiceEngine:
         response_pieces = []
         seg_index = 0
         print(f"[LLM] 开始生成回答(第{turn}问): {user_text[:40]}", flush=True)
+        first_token_seconds = None
+        tts_first_block_seconds = None
+        seg_times = []
         for sentence in sentence_chunks(streamer):
             response_pieces.append(sentence)
             seg_index += 1
+            if first_token_seconds is None:
+                first_token_seconds = round(time.monotonic() - endpoint_wall, 3)
+                print(f"[计时] 端点→LLM首字: {first_token_seconds*1000:.0f} ms", flush=True)
             request_id = f"turn_{turn:03d}_{seg_index:03d}"
             wav = tts_dir / f"{request_id}.wav"
             stream_dir = queue / f"stream_{request_id}"
@@ -286,16 +296,28 @@ class RealVoiceEngine:
                 "stream_dir": str(stream_dir),
             }, ensure_ascii=False), encoding="utf-8")
             print(f"[TTS] 段{seg_index}: {sentence[:40]}", flush=True)
+            seg_started = time.monotonic()
             self._stream_tts_segment(queue, request_id, stream_dir)
+            seg_sec = round(time.monotonic() - seg_started, 2)
+            seg_times.append(seg_sec)
+            if tts_first_block_seconds is None and self._first_spks_at is not None:
+                tts_first_block_seconds = round(self._first_spks_at - endpoint_wall, 3)
+                print(f"[计时] 端点→首块音频下发: {tts_first_block_seconds*1000:.0f} ms", flush=True)
+            print(f"[计时] 段{seg_index} 合成+下发: {seg_sec:.2f}s", flush=True)
         thread.join()
 
         response = "".join(response_pieces).strip()
         self._remember(f"A{turn}: {response[:80]}")
+        total_sec = round(time.perf_counter() - started, 3)
+        print(f"[计时] 第{turn}问: 端点→播完全部回答 {total_sec:.1f}s (LLM+合成 {seg_index} 段, 首字 {first_token_seconds}s, "
+              f"首块音频 {tts_first_block_seconds}s)", flush=True)
         row = {
             "time": _dt.now().isoformat(timespec="seconds"), "turn": turn,
             "recognized_text": user_text, "qwen_response": response,
             "asr_seconds": round(asr_seconds, 3),
-            "total_seconds": round(time.perf_counter() - started, 3),
+            "endpoint_to_first_token_seconds": first_token_seconds,
+            "endpoint_to_first_audio_seconds": tts_first_block_seconds,
+            "total_seconds": total_sec,
             "segments": seg_index, "input_wav": input_wav,
         }
         self._append_row(result_csv, row)
@@ -321,6 +343,8 @@ class RealVoiceEngine:
                 if not spoke:
                     spoke = True
                     self._push_text(f"SPKS {rate}")
+                    if self._first_spks_at is None:
+                        self._first_spks_at = time.monotonic()
                 if self.sink_pcm:
                     data = pcm if len(pcm) % 2 == 0 else pcm[:-1]
                     for off in range(0, len(data), 1200):
