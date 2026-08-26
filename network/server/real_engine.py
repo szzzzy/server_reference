@@ -241,33 +241,55 @@ class RealVoiceEngine:
                 pass
 
     def _calibrate_background(self, stream, seconds):
-        """借鉴 V5 开机校准:取流起始的 seconds 秒音频,用帧电平 10% 分位数估计背景。
-        窗口内即使有零星人声,分位数仍贴近噪声底;整窗都是人声或音频过短则保留默认背景。
-        每次引擎运行只尝试一次(会话内固定,与 V5"每插板校准一次"语义一致)。"""
+        """借鉴 V5 开机校准:用流起始的 seconds 秒音频,按帧电平 10% 分位数估计背景。
+        要求窗口内是真实帧(合成静音帧为 -120dB,不计);整窗都是人声/静音视为失败并重试,
+        3 次未成功才回退配置默认值。"""
         # 延迟导入:项目根已由 _load_and_answer_loop 插入 sys.path;
         # 此处为独立方法,不能复用其函数内局部导入。
         import numpy as np
         from board_serial_asr_test import capture_seconds, rms_dbfs
 
-        self._calibration_done = True
-        try:
-            samples, _ = capture_seconds(stream, seconds)
-        except TimeoutError:
+        need_bytes = int(seconds * 656 * 50)      # 656B/帧 × 50帧/s
+        for attempt in range(1, 4):
+            # 等足够真实字节到达(留 1.2 倍余量;合成静音帧不增加 real_bytes)
+            deadline = time.monotonic() + 8
+            while (stream.real_bytes_total - self._real_bytes_consumed
+                   < int(need_bytes * 1.2) and time.monotonic() < deadline):
+                self._short_sleep(0.2)
+            if stream.real_bytes_total - self._real_bytes_consumed < int(need_bytes * 1.2):
+                log.info("背景校准: 第%d次真实帧不足,稍后重试", attempt)
+                self._short_sleep(1.0)
+                continue
+            try:
+                samples, _ = capture_seconds(stream, seconds)
+            except TimeoutError:
+                self._real_bytes_consumed = stream.real_bytes_total
+                self._short_sleep(1.0)
+                continue
             self._real_bytes_consumed = stream.real_bytes_total
-            log.warning("背景校准超时,使用默认背景(dBFS=cfg)")
-            return
-        self._real_bytes_consumed = stream.real_bytes_total
-        if len(samples) < 6400:      # 少于 0.4s 的窗口不可信
-            log.warning("背景校准音频过短(%d 样本),使用默认背景", len(samples))
-            return
-        n = len(samples) // 320
-        rows = np.array(samples[:n * 320], dtype=np.int16).reshape(-1, 320)
-        bg = float(np.percentile([rms_dbfs(row) for row in rows], 10))
-        if -85.0 < bg < -40.0:
-            self._background_dbfs = bg
-            log.info("背景校准: %.1f dBFS (%.1fs 音频, 帧电平10%%分位)", bg, seconds)
-        else:
-            log.warning("背景校准窗口疑似含人声(%.1f dBFS),使用默认背景", bg)
+            n = len(samples) // 320
+            if n < 20:
+                self._short_sleep(1.0)
+                continue
+            rows = np.array(samples[:n * 320], dtype=np.int16).reshape(-1, 320)
+            dbfs = np.array([rms_dbfs(row) for row in rows])
+            silence_ratio = float(np.mean(dbfs < -100.0))   # 合成静音帧占比
+            bg = float(np.percentile(dbfs, 10))
+            if silence_ratio > 0.3:
+                log.info("背景校准: 第%d次窗口多为合成静音(%.0f%%),继续等待真实帧",
+                         attempt, silence_ratio * 100)
+                self._short_sleep(1.5)
+                continue
+            if -85.0 < bg < -40.0:
+                self._background_dbfs = bg
+                self._calibration_done = True
+                log.info("背景校准: %.1f dBFS (%.1fs 真实音频, 帧电平10%%分位, 第%d次)",
+                         bg, seconds, attempt)
+                return
+            log.warning("背景校准: 第%d次窗口疑似持续人声(%.1f dBFS),稍后重试", attempt, bg)
+            self._short_sleep(2.0)
+        self._calibration_done = True
+        log.warning("背景校准 3 次未成功,使用配置默认背景(dBFS=cfg)")
 
     # ---------------- 分句(重建:原版 sentence_chunks 含面向控制台的 print,
     # 在 GBK 控制台遇到 emoji 会炸;本实现逻辑一致、无副作用)----------------
@@ -427,6 +449,9 @@ class RealVoiceEngine:
                     data = pcm if len(pcm) % 2 == 0 else pcm[:-1]
                     for off in range(0, len(data), 1200):
                         self._push_pcm(data[off:off + 1200])
+                    # 按播放节奏(≈1.14×实时)推流:避免突发灌满板卡TCP缓冲,
+                    # 降低播放期设备 PONG 失联/重启概率(与本地V5 0.88 系数一致)
+                    time.sleep((len(data) / 2) / rate * 0.88)
                 else:
                     log.warning("无下行 sink,丢弃 %d B TTS 音频", len(pcm))
                 chunk_path.unlink(missing_ok=True)

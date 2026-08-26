@@ -110,9 +110,13 @@ class WssAdapter:
             ctx.load_cert_chain(certfile=self.cfg["paths"]["server_cert"],
                                 keyfile=self.cfg["paths"]["server_key"])
         self.ws_server = await websockets.serve(
-            self._handler, host, port, ssl=ctx, max_size=16 * 1024 * 1024
+            self._handler, host, port, ssl=ctx, max_size=16 * 1024 * 1024,
+            ping_interval=float(w.get("ping_interval", 60)),
+            ping_timeout=float(w.get("ping_timeout", 30)),
         )
-        log.info("WSS 服务已启动: wss://%s:%s%s (TLS=%s)", host, port, path, ctx is not None)
+        log.info("WSS 服务已启动: wss://%s:%s%s (TLS=%s, ping=%ss/%ss)",
+                 host, port, path, ctx is not None,
+                 w.get("ping_interval", 60), w.get("ping_timeout", 30))
 
     async def stop(self):
         if self.ws_server:

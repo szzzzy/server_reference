@@ -17,7 +17,9 @@
     "port": 9443,
     "path": "/voice",
     "token": "julia-test-token-2026",
-    "tls": true
+    "tls": true,
+    "ping_interval": 60,
+    "ping_timeout": 30
   },
   "file_server": {
     "host": "0.0.0.0",
