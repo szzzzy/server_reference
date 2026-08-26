@@ -27,3 +27,6 @@ certs/clients/
 *.pem
 
 third_party/CosyVoice/
+
+# 固件构建产物(源码已入库;build 可重新生成)
+julia-fused-base/build/

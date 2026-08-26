@@ -1,0 +1,563 @@
+menu "Example Configuration"
+
+    orsource "$IDF_PATH/examples/common_components/env_caps/$IDF_TARGET/Kconfig.env_caps"
+
+    config OTA_PRODUCT_ID
+        string "OTA product identifier"
+        default "native-ota-device"
+        help
+            Stable product/model identifier reported to the OTA policy server. The server
+            should use this field to prevent firmware for another product from being offered.
+
+    config OTA_HARDWARE_VERSION
+        string "Hardware version"
+        default "1.0"
+        help
+            Hardware revision reported in every OTA check request. Keep this value stable for
+                all devices with the same firmware compatibility requirements.
+
+    config OTA_IMAGE_PROJECT_NAME
+        string "Expected image project name"
+        default "native_ota"
+        help
+            Expected esp_app_desc project_name embedded in OTA images. This prevents an
+            image built for another ESP-IDF project from being installed accidentally.
+
+    config OTA_ALLOWED_URL_HOSTS
+        string "Allowed OTA URL hosts"
+        default ""
+        help
+            Comma-separated exact host names allowed for OTA HTTPS URLs. Leave empty only
+            for local development; production builds should set this to the approved CDN
+            or firmware service host names.
+
+    config OTA_MIN_FREE_HEAP
+        int "Minimum free heap during boot self-test"
+        range 4096 1048576
+        default 16384
+        help
+            Minimum free 8-bit-capable heap required before a pending image is confirmed.
+
+    config OTA_ENABLE_GPIO_DIAGNOSTIC
+        bool "Use GPIO diagnostic during OTA boot self-test"
+        default y
+        help
+            Keep the example GPIO diagnostic as an optional test switch. It is combined
+            with local health checks and is not replaced by Wi-Fi or MQTT connectivity.
+
+    config OTA_TEST_BUILD
+        bool "TEST ONLY: enable OTA boot fault injection"
+        default n
+        help
+            Internal gate for test-only OTA fault injection. Set this only from a
+            dedicated test sdkconfig fragment; production defaults must leave it off.
+
+    config OTA_TEST_FORCE_BOOT_HEALTH_FAIL
+        bool "TEST ONLY: force OTA boot health check failure"
+        depends on OTA_TEST_BUILD
+        default n
+        help
+            Forces the product boot-health hook to fail while validating a
+            PENDING_VERIFY image. This exercises the normal rollback path without
+            requiring a GPIO action. Enable only from a dedicated test build.
+
+    config OTA_REQUIRE_SIGNED_IMAGE
+        bool "Require Secure Boot signed OTA image"
+        default n
+        help
+            Require production Secure Boot configuration for OTA image verification. Enable
+            only together with the project's Secure Boot provisioning plan.
+
+    config OTA_CHECK_INTERVAL_SECONDS
+        int "OTA check interval (seconds)"
+        range 60 86400
+        default 21600
+        help
+            Base interval between active OTA checks. The default is 6 hours. A check is also
+            sent immediately after the MQTT connection becomes ready.
+
+    config OTA_CHECK_JITTER_SECONDS
+        int "Maximum OTA check jitter (seconds)"
+        range 0 3600
+        default 1800
+        help
+            Random delay added to each periodic check. This spreads requests from a large fleet
+            over time and reduces synchronized load on the OTA policy server.
+
+    config OTA_CHECK_RESPONSE_TIMEOUT_SECONDS
+        int "OTA check response timeout (seconds)"
+        range 1 300
+        default 15
+        help
+            Time to wait for the matching ota_check_response before a short retry.
+
+    config OTA_CHECK_RESPONSE_RETRY_COUNT
+        int "OTA check response retry count"
+        range 0 5
+        default 2
+        help
+            Number of short retries after a response timeout. Exhaustion enters bounded
+            background recovery checks and never interrupts local application work.
+
+    config OTA_CHECK_RESPONSE_RETRY_BASE_SECONDS
+        int "OTA check retry base delay (seconds)"
+        range 1 60
+        default 2
+        help
+            Initial delay for timed-out OTA check retries; later retries use bounded
+            exponential backoff with a small random jitter.
+
+    config OTA_CHECK_RESPONSE_RETRY_MAX_SECONDS
+        int "OTA check retry maximum delay (seconds)"
+        range 1 300
+        default 10
+        help
+            Upper bound for an OTA check retry backoff delay.
+
+    config OTA_CHECK_RECOVERY_INITIAL_SECONDS
+        int "OTA check recovery initial delay (seconds)"
+        range 1 OTA_CHECK_RECOVERY_MAX_SECONDS
+        default 30
+        help
+            First background recovery wait after OTA check short retries are exhausted.
+            Each failed recovery check doubles the wait, up to the maximum below. The
+            device keeps checking until a valid ota_check_response arrives.
+
+    config OTA_CHECK_RECOVERY_MAX_SECONDS
+        int "OTA check recovery maximum delay (seconds)"
+        range 1 86400
+        default 300
+        help
+            Upper bound for background recovery waits. After the policy server outage,
+            the device checks at most this often and immediately returns to the normal
+            interval once a valid response is received.
+
+    config OTA_DOWNLOAD_RETRY_THRESHOLD
+        int "OTA download consecutive network failure threshold"
+        range 1 20
+        default 3
+        help
+            Consecutive DNS, connection, TLS transport or HTTP read failures before a
+            temporary cooldown. This never quarantines an artifact.
+
+    config OTA_DOWNLOAD_COOLDOWN_BASE_SECONDS
+        int "OTA download cooldown base (seconds)"
+        range 1 3600
+        default 60
+        help
+            First cooldown after the threshold. Later cooldowns double, capped below.
+
+    config OTA_DOWNLOAD_COOLDOWN_MAX_SECONDS
+        int "OTA download cooldown maximum (seconds)"
+        range 1 86400
+        default 3600
+        help
+            Upper bound for a network-failure cooldown.
+
+    config COMM_HEARTBEAT_INTERVAL_SECONDS
+        int "Communication heartbeat/keepalive interval (seconds)"
+        range 5 3600
+        default 60
+        help
+            MQTT protocol keepalive interval. The MQTT client uses this value to detect
+            stale links without relying on OTA traffic.
+
+    config COMM_RECONNECT_INTERVAL_SECONDS
+        int "Communication reconnect interval (seconds)"
+        range 1 3600
+        default 10
+        help
+            Delay before MQTT automatic reconnect attempts. The ESP-IDF client keeps
+            reconnect enabled; this value controls its retry interval.
+
+    config NETWORK_WIFI_RETRY_BASE_MS
+        int "Wi-Fi reconnect initial delay (ms)"
+        range 250 60000
+        default 1000
+        help
+            Initial delay after a failed Wi-Fi association. Subsequent attempts
+            use exponential backoff and continue indefinitely.
+
+    config NETWORK_WIFI_RETRY_MAX_MS
+        int "Wi-Fi reconnect maximum delay (ms)"
+        range 1000 600000
+        default 60000
+        help
+            Upper bound for Wi-Fi reconnect delays. A router outage never makes
+            the application give up permanently or retry in a tight loop.
+
+    config NETWORK_WIFI_RETRY_JITTER_PERCENT
+        int "Wi-Fi reconnect jitter (percent)"
+        range 0 50
+        default 20
+        help
+            Randomly subtract up to this percentage from each capped backoff
+            delay, spreading reconnection attempts across devices.
+
+    config OTA_PROGRESS_STEP_PERCENT
+        int "Minimum OTA progress step (percent)"
+        range 1 100
+        default 5
+        help
+            Emit a downloading progress event when progress advances by at least this
+            percentage. Progress is kept in RAM and is never written to NVS.
+
+    config OTA_PROGRESS_INTERVAL_SECONDS
+        int "Maximum OTA progress interval (seconds)"
+        range 1 3600
+        default 10
+        help
+            Emit a downloading progress event when this much time has elapsed since the
+            previous progress event, even if the percentage step has not been reached.
+
+    config OTA_REPORT_QUEUE_DEPTH
+        int "OTA status critical queue depth"
+        range 4 16
+        default 8
+        help
+            Bounded number of critical OTA status events held before they enter the
+            ESP-MQTT asynchronous outbox. Progress uses one replaceable RAM slot.
+
+    choice COMM_DEVICE_AUTH_MODE
+        prompt "Device authentication mode"
+        default COMM_DEVICE_AUTH_USERNAME_PASSWORD
+        help
+            Select the credential carried by the MQTT control connection. Token mode uses
+            MQTT username/password fields.
+            Certificate mode uses the optional mTLS PEM files embedded by CMake.
+
+        config COMM_DEVICE_AUTH_NONE
+            bool "No application credential (TLS server authentication only)"
+
+        config COMM_DEVICE_AUTH_USERNAME_PASSWORD
+            bool "Username and password"
+
+        config COMM_DEVICE_AUTH_TOKEN
+            bool "Bearer/token credential"
+
+        config COMM_DEVICE_AUTH_CERTIFICATE
+            bool "Client certificate (mTLS)"
+    endchoice
+
+    config COMM_DEVICE_AUTH_TOKEN_VALUE
+        string "Device bearer/token value"
+        default ""
+        help
+            Device token used for control-plane authentication. Keep this value out of
+            sdkconfig.defaults and inject it through a protected provisioning/build flow.
+
+    config COMM_DEVICE_AUTH_TOKEN_USERNAME
+        string "Token username"
+        default "token"
+        help
+            MQTT username sent together with COMM_DEVICE_AUTH_TOKEN_VALUE. Some brokers
+            use a fixed username such as token or the product name before validating the
+            token in the password field.
+
+    config COMM_DEVICE_AUTH_USERNAME
+        string "Device authentication username"
+        default ""
+        help
+            Generic username used by the MQTT control client in Username and password
+            mode. Keep production credentials out of sdkconfig.defaults.
+
+    config COMM_DEVICE_AUTH_PASSWORD
+        string "Device authentication password"
+        default ""
+        help
+            Generic password used by the MQTT control client in Username and password
+            mode. Keep production credentials out of sdkconfig.defaults.
+
+    comment "Certificate mode uses fixed protected files: server_certs/device_client_cert.pem and server_certs/device_client_key.pem"
+        depends on COMM_DEVICE_AUTH_CERTIFICATE
+
+    config COMM_MQTT_BROKER_URI
+        string "MQTT broker URI"
+        default "mqtt://172.20.10.2:1883"
+        help
+            MQTT broker URI. Production devices should use mqtts:// and a broker
+            certificate trusted by the ESP-IDF certificate bundle.
+
+    config COMM_MQTT_USERNAME
+        string "MQTT username"
+        default ""
+        help
+            Per-device or per-device-group MQTT username. Used when the generic device
+            authentication mode is Username and password. Store production credentials
+            through a protected provisioning flow instead of committing them to source.
+
+    config COMM_MQTT_PASSWORD
+        string "MQTT password"
+        default ""
+        help
+            MQTT password for development or provisioning. Do not commit production
+            passwords to sdkconfig.defaults. Token mode uses the generic token value
+            instead of this field. This field remains as a backward-compatible fallback
+            when generic device authentication credentials are empty.
+
+    config COMM_MQTT_OTA_CHECK_TOPIC
+        string "MQTT OTA check request topic"
+        default "/device/ota/check"
+        help
+            Common topic to which devices publish small ota_check requests. Requests are
+            sent with QoS 1 and are not retained.
+
+    config COMM_MQTT_OTA_RESPONSE_TOPIC_PREFIX
+        string "MQTT OTA response topic prefix"
+        default "/device/ota/response"
+        help
+            Prefix for server decisions. The device appends its stable device ID and
+            subscribes to <prefix>/<device_id>, so responses are not broadcast fleet-wide.
+
+    config COMM_MQTT_OTA_NOTIFY_TOPIC_PREFIX
+        string "MQTT OTA notify topic prefix"
+        default "/device/ota/notify"
+        help
+            Prefix for server ota_notify messages. The device subscribes to
+            <prefix>/<device_id> and never starts a download directly from a notify.
+
+    config COMM_MQTT_OTA_STATUS_TOPIC_PREFIX
+        string "MQTT OTA status topic prefix"
+        default "/device/ota/status"
+        help
+            Prefix for device OTA lifecycle status events. The device publishes to
+            <prefix>/<device_id> with QoS 1 and retain disabled.
+
+    config COMM_MQTT_OTA_NOTIFY_THROTTLE_SECONDS
+        int "MQTT OTA notify throttle (seconds)"
+        range 0 3600
+        default 5
+        help
+            Ignore valid duplicate ota_notify messages received within this interval.
+
+    config COMM_MQTT_SUBACK_TIMEOUT_SECONDS
+        int "MQTT OTA subscription ACK timeout (seconds)"
+        range 1 120
+        default 15
+        help
+            Maximum time to wait for both response and notify subscription acknowledgements.
+            A missing acknowledgement rebuilds the MQTT connection.
+
+    config COMM_MQTT_VOICE_CMD_TOPIC
+        string "MQTT voice command topic"
+        default "voice/esp32s3/vcmd"
+        help
+            Topic on which the device receives plain-text voice commands
+            (FILE_SEND SD:/<name>, MIC_START, MIC_STOP). Commands are routed to
+            the voice_service module and never touch the OTA control plane.
+
+    menu "WSS voice stream configuration"
+
+        config WSS_SERVER_HOST
+            string "WSS voice server host"
+            default "172.20.10.2"
+            help
+                Host name or IP address of the WSS (WebSocket over TLS) voice streaming
+                server. The server certificate must chain to server_certs/ca_cert.pem.
+
+        config WSS_SERVER_PORT
+            int "WSS voice server port"
+            range 1 65535
+            default 9443
+            help
+                TCP port of the WSS voice streaming server.
+
+        config WSS_PATH
+            string "WSS upgrade path"
+            default "/voice"
+            help
+                HTTP path used in the WebSocket upgrade request, e.g. /voice.
+
+        config WSS_TOKEN
+            string "WSS bearer token (fallback)"
+            default ""
+            help
+                Bearer token sent in the WSS Authorization header. When the generic
+                device token COMM_DEVICE_AUTH_TOKEN_VALUE is not empty it is used
+                first; this value only applies as a fallback. Keep production tokens
+                out of sdkconfig.defaults.
+
+        config WSS_RECONNECT_INTERVAL_SECONDS
+            int "WSS reconnect interval (seconds)"
+            range 1 3600
+            default 5
+            help
+                Delay before the voice session task retries a failed connection or a
+                closed session. Reconnection continues indefinitely.
+
+        config WSS_KEEPALIVE_INTERVAL_SECONDS
+            int "WSS keepalive PING interval (seconds)"
+            range 5 3600
+            default 15
+            help
+                Idle time before the client probes the link with a WebSocket PING.
+                An idle link is healthy; after the PING, only a missing downlink
+                frame (see the timeout below) is treated as a dead connection.
+                Any downlink frame - a PONG or any other frame - proves the link
+                is alive and resets the keepalive timer. TCP keepalive is enabled
+                as well.
+
+        config WSS_PONG_TIMEOUT_SECONDS
+            int "WSS keepalive PONG timeout (seconds)"
+            range 3 300
+            default 10
+            help
+                Maximum time to wait for any downlink frame (PONG or other) after
+                a keepalive PING before the client tears down the link and
+                reconnects. Keep this shorter than the PING interval so probes
+                never pile up.
+
+        config WSS_TASK_STACK_SIZE
+            int "WSS session task stack size (bytes)"
+            range 16384 65536
+            default 16384
+            help
+                Stack size of the WSS session task. The TLS handshake requires at
+                least 16 KB; do not reduce the lower bound.
+
+    endmenu
+
+    menu "Voice push demo (device-initiated)"
+
+        config VOICE_PUSH_DEMO_ENABLE
+            bool "Enable the device-initiated voice push demo"
+            default n
+            help
+                Actively pushes the project's test audio files (??????/ directory,
+                listed in voice_push_demo.c) to the WSS server without a server
+                FILE_SEND command: the device enqueues each "SD:/<name>" URI into
+                the voice service command queue and the session task sends
+                BEGIN FILE ... END for every file.
+
+        config VOICE_PUSH_DEMO_INTERVAL_SECONDS
+            int "Repeat explicit transfer every N seconds; 0 = transfer once"
+            range 0 86400
+            default 0
+            depends on VOICE_PUSH_DEMO_ENABLE
+            help
+                Repeat the whole explicit file list every N seconds. Set to 0 to
+                transfer the list exactly once after the WSS client has started.
+
+    endmenu
+
+    menu "Audio material download (data partition)"
+
+        config AUDIO_MAX_FILE_SIZE
+            int "Maximum audio file size (bytes)"
+            range 65536 8388608
+            default 3145728
+            help
+                Upper bound accepted for audio_check_response file_size. The audio
+                storage data partition must be at least this large.
+
+        config AUDIO_STORAGE_PARTITION
+            string "Audio storage data partition label"
+            default "audio_data"
+            help
+                Data partition label used to store the downloaded audio material.
+                A matching data partition must exist in the partition table.
+
+        config COMM_MQTT_AUDIO_STATUS_TOPIC_PREFIX
+            string "MQTT audio status topic prefix"
+            default "/device/audio/status"
+            help
+                Prefix for audio material lifecycle status events. The device
+                publishes to <prefix>/<device_id> with QoS 1 and retain disabled.
+
+    endmenu
+
+    menu "SD card (SDMMC 1-bit) for voice files"
+
+        config SD_CARD_ENABLE
+            bool "Mount SD card for voice files"
+            default y
+            help
+                Mounts the SD card (FAT) at /sdcard over SDMMC 1-bit so
+                voice_service can serve "SD:/<name>" FILE_SEND URIs and the push
+                demo can transfer the test audio files. D3/CS is routed through
+                the on-board TCA9554 (Extend_IO3) and is driven high first so
+                the card stays in SD (SDMMC) mode. The card is never formatted.
+
+        config SD_CARD_PIN_CLK
+            int "SD card SDMMC CLK pin"
+            range 0 48
+            default 14
+            depends on SD_CARD_ENABLE
+            help
+                Waveshare ESP32-S3-LCD-1.85: CLK = IO14.
+
+        config SD_CARD_PIN_CMD
+            int "SD card SDMMC CMD pin"
+            range 0 48
+            default 17
+            depends on SD_CARD_ENABLE
+            help
+                Waveshare ESP32-S3-LCD-1.85: CMD = IO17.
+
+        config SD_CARD_PIN_D0
+            int "SD card SDMMC D0 pin"
+            range 0 48
+            default 16
+            depends on SD_CARD_ENABLE
+            help
+                Waveshare ESP32-S3-LCD-1.85: D0 = IO16.
+
+        config SD_CARD_I2C_SCL
+            int "TCA9554 I2C SCL pin"
+            range 0 48
+            default 10
+            depends on SD_CARD_ENABLE
+            help
+                I2C bus of the on-board TCA9554 GPIO expander that controls the
+                SD card D3/CS. Waveshare ESP32-S3-LCD-1.85: SCL = IO10.
+
+        config SD_CARD_I2C_SDA
+            int "TCA9554 I2C SDA pin"
+            range 0 48
+            default 11
+            depends on SD_CARD_ENABLE
+            help
+                I2C bus of the on-board TCA9554 GPIO expander. Waveshare
+                ESP32-S3-LCD-1.85: SDA = IO11.
+
+        config SD_CARD_FREQ_KHZ
+            int "SD card SDMMC clock (kHz)"
+            range 400 40000
+            default 20000
+            depends on SD_CARD_ENABLE
+            help
+                SDMMC clock for the card. 20000 kHz (20 MHz) is the proven
+                default; reduce to 10000 if the card or wiring is unstable.
+
+    endmenu
+
+    config EXAMPLE_SKIP_COMMON_NAME_CHECK
+        bool "Skip server certificate CN fieldcheck"
+        default n
+        help
+            This allows you to skip the validation of OTA server certificate CN field.
+
+    config EXAMPLE_SKIP_VERSION_CHECK
+        bool "Skip firmware version check"
+        default n
+        help
+            This allows you to skip the firmware version check.
+
+    config EXAMPLE_GPIO_DIAGNOSTIC
+        int "Number of the GPIO input for diagnostic"
+        range ENV_GPIO_RANGE_MIN ENV_GPIO_IN_RANGE_MAX
+        default 4
+        help
+            Used to demonstrate how a rollback works.
+            The selected GPIO will be configured as an input with internal pull-up enabled.
+            To trigger a rollback, this GPIO must be pulled low while the message
+            `Diagnostics (5 sec)...` which will be on first boot.
+            If GPIO is not pulled low then the operable of the app will be confirmed.
+
+    config EXAMPLE_OTA_RECV_TIMEOUT
+        int "OTA Receive Timeout"
+        default 5000
+        help
+            Maximum time for reception
+
+endmenu

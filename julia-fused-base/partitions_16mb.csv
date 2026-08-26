@@ -1,0 +1,14 @@
+# Name,   Type, SubType, Offset,   Size, Flags
+# Based on ESP-IDF's partitions_two_ota_large.csv. Reserve 3 MiB for raw
+# audio artifacts while keeping two equal, 4 MiB OTA application slots.
+# Added 4 MiB "model" partition (spiffs) for ESP-SR WakeNet/word models
+# (julia-fused-base 唤醒词 wn9_nihaoxiaozhi_tts, 由构建自动打包 srmodels.bin).
+# Keep 64 KiB for OTA resume records and the persisted QoS 1 status-event queue.
+# Keep the offset column blank so ESP-IDF can align data and app partitions.
+nvs,      data, nvs,     ,        0x10000,
+otadata,  data, ota,     ,        0x2000,
+phy_init, data, phy,     ,        0x1000,
+ota_0,    app,  ota_0,   ,        0x400000,
+ota_1,    app,  ota_1,   ,        0x400000,
+model,    data, spiffs,  ,        0x400000,
+audio_data,data, fat,     ,        0x300000,
