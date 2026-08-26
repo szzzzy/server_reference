@@ -244,6 +244,11 @@ class RealVoiceEngine:
         """借鉴 V5 开机校准:取流起始的 seconds 秒音频,用帧电平 10% 分位数估计背景。
         窗口内即使有零星人声,分位数仍贴近噪声底;整窗都是人声或音频过短则保留默认背景。
         每次引擎运行只尝试一次(会话内固定,与 V5"每插板校准一次"语义一致)。"""
+        # 延迟导入:项目根已由 _load_and_answer_loop 插入 sys.path;
+        # 此处为独立方法,不能复用其函数内局部导入。
+        import numpy as np
+        from board_serial_asr_test import capture_seconds, rms_dbfs
+
         self._calibration_done = True
         try:
             samples, _ = capture_seconds(stream, seconds)
