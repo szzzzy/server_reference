@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent
+ROOT = HERE.parents[1]
 sys.path.insert(0, str(HERE))
 
 from common import (detect_ip, load_test_wav, make_sine_wav, pcm1_build,

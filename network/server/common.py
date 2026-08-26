@@ -15,8 +15,8 @@ HERE = Path(__file__).resolve().parent
 
 
 def project_root():
-    # 独立目录:virtual_server 位于项目根下
-    return HERE.parent
+    # 独立目录:network/server 位于项目根下两级
+    return HERE.parents[1]
 
 
 def load_json(path):

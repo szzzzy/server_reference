@@ -46,7 +46,7 @@ async def amain(args, cfg, run_dir):
     hub = SessionHub(run_dir)
     engine = make_engine(
         cfg.get("voice", {}).get("mode", "stub"), hub,
-        cfg=cfg, run_dir=run_dir, project_root=HERE.parent)
+        cfg=cfg, run_dir=run_dir, project_root=HERE.parents[1])
     store_path = resolve_path(HERE, cfg.get("paths", {}).get("manifest", "releases/manifest.json"))
     store = ManifestStore(store_path)
     store.data.setdefault("firmware", {})

@@ -16,13 +16,13 @@ next_stage/**/runs/
 backup/
 prompt_cache/
 .venv_vs/
-virtual_server/runs/
-virtual_server/sim_data/
-virtual_server/releases/files/
-virtual_server/releases/manifest.json
-certs/ca/
-certs/server/
-certs/clients/
+network/server/runs/
+network/server/sim_data/
+network/server/releases/files/
+network/server/releases/manifest.json
+network/certs/ca/
+network/certs/server/
+network/certs/clients/
 *.key
 *.pem
 
