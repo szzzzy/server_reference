@@ -1,168 +1,588 @@
-# 动态底噪 VAD 改造方案（规划稿，未执行）
+# 动态底噪 VAD 改造方案（执行稿）
 
-> 状态：**仅规划，不执行**。本文档落地后，先提交当前版本基线，再按本方案分阶段实施。
-> 范围：`voice_server_full/`（服务器侧 `engine/board_serial_asr_test.py` + `server/real_engine.py`）。
-> 设备端（ESP32 WakeNet / 硬件唤醒阈值）、WSS 协议、固件**均不动**。
-
----
-
-## 1. 背景与目标
-
-### 1.1 问题定义
-
-当前 VAD 的底噪是"一次校准、全程不变"：
-
-- 每次 WSS 会话开始、收到首帧后，`_calibrate_background()` 用前 2.5s 真实音频的帧电平 **10% 分位**估一个 `background_dbfs`（`server/real_engine.py:436`）；
-- 3 次校准失败回退配置默认 **-60 dBFS**（`config.json → voice.real.vad.background_dbfs`）；
-- 之后整个会话（含多轮 MIC_START 循环）的起始/端点阈值恒为 `background_dbfs + 3dB`（`engine/board_serial_asr_test.py:227-230`）。
-
-环境不变时无问题；环境变化时依次出现四类故障：
-
-1. 噪声升过 `背景+3dB` → 噪声被当成"语音起始"（误触发）；
-2. 噪声持续高于端点阈值 → 活跃帧持续抵扣尾静音计数 → **端点永不触发**；
-3. 只能靠 `max_seconds=15s` 硬截断 → 说完话后白等最多 15s，且噪声被送进 ASR（乱文/幻觉轮）；
-4. 噪声下降或设备挪动后阈值相对过高 → 轻声、远场话漏检。
-
-### 1.2 目标
-
-把"固定底噪"升级为"**随环境变化的底噪估计**"，使阈值始终保持"当前底噪 + 固定信噪比偏移"，消除上述四类故障，且：
-
-- 默认关闭、可配置、可回归（`dynamic_floor: false` 时行为与现状完全一致）；
-- 纯服务器侧改动，不动协议/固件/设备端；
-- 估计器必须抗"语音污染"，即语音帧不得抬高底噪。
+> 状态：**执行稿，未开始实施**。现有版本基线已提交（基线 `c637380`，方案初稿 `e6e7486`，本稿为定稿）。
+> 范围：`voice_server_full/` 中服务器侧 VAD。
+> 本稿整合：双时间尺度估计器、会话级状态、快速窗无门控修正、滞回方向修正、协议边界（MIC_START/MIC_STOP）确认。
 
 ---
 
-## 2. 设计
+## 1. 问题
 
-### 2.1 核心思路
+当前 VAD 的 `background_dbfs` 在会话开始时通过 `_calibrate_background()` 估计一次，之后整个会话保持不变。
 
-`capture_until_endpoint()` 内把 `background_dbfs` 从**常量**改成**状态变量 `bg_t`**（每帧循环内更新）；
-起始阈值 = `bg_t + start_above_db`、端点阈值 = `bg_t + end_above_db`，每帧重新计算（只是两次加法，零额外成本）。
-其余判定逻辑（120ms/300ms 起始窗、400ms 尾静音、4 倍抵扣）**一行不动**。
+当前阈值：
 
-### 2.2 底噪估计器（三个机制缺一不可）
-
-```
-状态:
-  bg_t          —— 当前底噪估计(初值 = 现有 _calibrate_background 结果或配置默认)
-  ring          —— 环形缓冲,保存最近 8s(400 帧)的候选帧 dBFS
-  last_update   —— 上次重算分位时刻
-
-每 20ms 帧(在 capture_until_endpoint 帧循环内):
-  candidate = (真实帧) 且 (frame_dbfs < bg_t + gate_db) 且 (frame_dbfs > -100dB)
-  ① 门控:   只有 candidate 才入 ring —— 低于当前阈值的帧才可能是噪声;
-             高于阈值的一律不碰,语音(高于阈值)永远进不了估计器
-  ② 滑动分位:每 0.5s 对 ring 重算一次 10% 分位 p(与现有校准同构,抗突发/语音污染)
-  ③ 限速+钳制:step = clamp(p - bg_t,
-                          -down_max_db_per_05s, +up_max_db_per_05s)
-             bg_t = clamp(bg_t + step, floor_min_dbfs, floor_max_dbfs)
-
-合成静音帧排除: 合成帧为 -120dB,已被 "> -100dB" 条件排除;
-             另外复用 real_bytes_total 判定"真实帧",双保险(与现有校准一致)。
+```text
+start_threshold = background_dbfs + start_above_db
+end_threshold   = background_dbfs + end_above_db
 ```
 
-参数语义（默认值见 §3）：
+环境噪声变化后会出现：
 
-- **上升快、下降慢**：`up_max_db_per_s=3`（尽快跟上突变噪声，缩短噪声误触发期）；`down_max_db_per_s=0.5`（下降信号可能来自语音间隙，慢一点；分位本身已抗污染，限速只是保险）；
-- `gate_db=12`：候选门控余量（比阈值偏移 3dB 宽，让"噪声略高于旧阈值"时仍能被吸收——这是能让底噪**跟上噪声上升**的关键：旧阈值以下的噪声帧永远存在，直到新噪声完全覆盖）；
-- `floor_min_dbfs=-80 / floor_max_dbfs=-35`：语义钳制，避免病态值。
+* 底噪升高：噪声误触发 speech start；
+* 噪声持续高于 endpoint threshold：尾静音无法累计，端点迟迟不触发；
+* 最终依赖 `max_seconds=15s` 强制截断；
+* 底噪下降后：阈值偏高，轻声或远场语音可能漏检。
 
-### 2.3 数据可得性约束（设计前提，务必理解）
+目标是把：
 
-- **回合内**：VAD 收集期间有连续真实帧 → 动态估计可用；起始判定前的帧 + 说话间隙低于阈值的帧都是有效素材；
-- **回合间**：TTS 播报期间设备停传（MIC_STOP），且 RoundBuffer 补的是 -120dB 合成帧 → **没有真实噪声信息**；
-- 因此跨回合环境变化只能靠：① 本回合开始（MIC_START 后用户开口前）的帧；② 每轮语音前的帧。两者都被估计器自动吸收，**无需额外机制**；
-- 长安静期（播报 40s+ 后环境变了）到下一轮开口之间学习窗口较短 → 由 `up_max_db_per_s=3` 保证几秒内基本跟上；若仍不足，用 §6 Phase 0 的"回合级重估"兜底。
+```text
+固定 background_dbfs
+```
 
-### 2.4 与现有校准的关系
+改为：
 
-`_calibrate_background()` **保留**：作为 `bg_t` 的初值来源（3 次失败回退配置默认）。动态模式把"一次性校准"变成"持续学习"，初值精度要求大幅降低——校准失败不再致命。
+```text
+动态 bg_t
+```
+
+使 VAD 阈值持续跟随当前环境。
 
 ---
 
-## 3. 配置设计（`server/config.json`）
+## 2. 核心设计
 
-在 `voice.real.vad` 下新增段（动态模式默认**关**，保持可回归）：
+`capture_until_endpoint()` 内：
+
+```text
+background_dbfs
+```
+
+只作为初始值，之后维护：
+
+```text
+bg_t
+```
+
+每帧重新计算：
+
+```text
+start_threshold = bg_t + start_above_db
+end_threshold   = bg_t + end_above_db
+```
+
+现有 speech start、endpoint、尾静音、`max_seconds` 等状态机逻辑不改。
+
+**关键约束（A 修正）：`bg_t` 与两个 ring 必须是会话级状态**。`capture_until_endpoint()` 每轮返回后即结束，若 `bg_t` 是函数局部变量，每轮都会从校准初值重新开始，跨回合学习全部失效。因此：
+
+```text
+engine/board_serial_asr_test.py 新增 NoiseFloorTracker 类
+    ├─ 持有 bg_t + fast/slow ring + 更新状态
+    ├─ 接口: on_frame(...) / bg() / reset(bg) / diagnostics()
+    └─ 与 VAD 状态机解耦,本地串口 V5 链路亦可复用
+
+RealVoiceEngine(会话级) 持有一个实例
+    └─ 每轮调用 capture_until_endpoint(..., floor_tracker=self._floor)
+
+floor_tracker=None 时行为与现状完全一致(回归保障)
+```
+
+---
+
+## 3. 动态底噪估计
+
+单一 8 s 窗口不适合同时处理噪声上升和下降。
+
+原因是：
+
+* 噪声下降时，低电平新样本会很快拉低 P10；
+* 噪声上升时，旧低噪声样本会长期占据 P10，导致跟随过慢。
+
+因此使用两个时间尺度。
+
+## 3.1 Fast window
+
+负责环境变吵：
+
+```text
+最近约 1.5 s(仅真实帧,见 §4 修正 B)
+→ 10% percentile(不对样本套 gate,见 §4)
+→ p_fast
+```
+
+当：
+
+```text
+p_fast > bg_t + rise_trigger_db
+```
+
+持续若干次后：
+
+```text
+bg_t
+```
+
+以较快速度向 `p_fast` 上升。
+
+默认：
+
+```text
+up_max_db_per_s = 3.0
+```
+
+## 3.2 Slow window
+
+负责稳定估计和环境变安静：
+
+```text
+最近约 8 s candidate frames(套 gate,见 §4)
+→ 10% percentile
+→ p_slow
+```
+
+如果：
+
+```text
+p_slow < bg_t
+```
+
+则 `bg_t` 缓慢下降。
+
+默认：
+
+```text
+down_max_db_per_s = 0.5
+```
+
+最终效果：
+
+```text
+环境变吵 → 快速跟随
+环境变静 → 缓慢回落
+```
+
+---
+
+## 4. Candidate 过滤与更新时机（修正 B：gate 悖论）
+
+**Fast 窗口不得对样本套 gate。**
+
+原因：噪声突变（风扇/空调从安静环境启动）常比底噪高 **15~20 dB**（如 -55 → -35），
+超过 `gate_db=12`。若 fast 窗口也套 gate：
+
+* 噪声帧全部被排除 → 1.5 s 后 ring 中旧安静样本过期 → `fast_min_frames` 不满足；
+* `p_fast` 无法计算 → **底噪永不上升** → "噪声突升 → 端点不触发 → 15 s 超时"这一目标故障完全没被修复。
+
+因此 fast 窗口的候选定义：
+
+```text
+fast_candidate = real_frame  AND frame_dbfs > -100
+```
+
+只排除合成静音帧（RingBuffer 补的 -120 dB 帧），不对电平值设上限。
+
+**污染的防护改由"更新时机"保证**：
+
+```text
+允许估计器更新(上升/下降) ⟺ 本轮尚未判定 speech_started(即每轮预语音段)
+speech_started 置位后 → 本轮冻结估计器
+```
+
+效果：
+
+* 预语音段内，即使噪声 +20 dB，`p_fast ≈ 新噪声值` → 上升确认后按 3 dB/s 跟上；
+* 语音一旦开始，**语音结构性进不了估计器**（不只是统计上难进）；
+* 每轮预语音段都会重新学习 → 跨轮自适应成立。
+
+**Slow 窗口保留 gate**（保守稳定）：
+
+```text
+slow_candidate = real_frame
+                 AND frame_dbfs > -100
+                 AND frame_dbfs < bg_t + gate_db
+```
+
+轻声或低 SNR 语音仍可能 slow 窗口进入，因此多道防线共同降低污染风险：
+
+```text
+slow: gate + percentile + 最小样本数 + 0.5 dB/s 下降限速
+fast: 预语音段时机限制 + 上升确认 + 3 dB/s 上升限速
+```
+
+---
+
+## 5. Ring 实现
+
+ring 中保存：
+
+```text
+(timestamp, frame_dbfs)
+```
+
+而不是简单使用：
+
+```python
+deque(maxlen=N)
+```
+
+每次更新前删除超出时间窗的数据。
+
+例如：
+
+```text
+fast_ring：仅保留最近 1.5 s
+slow_ring：仅保留最近 8 s
+```
+
+这样窗口语义始终是真正的"最近 N 秒"，不会因为 candidate 较少而残留很久以前的数据。
+
+---
+
+## 6. 更新逻辑
+
+默认每：
+
+```text
+0.5 s
+```
+
+更新一次（帧循环内按时间戳检查，无需独立线程）。
+
+伪代码：
+
+```python
+if not speech_started:                       # 修正 B:仅预语音段
+    if enough_fast_samples and p_fast > bg_t + rise_trigger_db:
+        if rise_condition_confirmed:         # 连续 2 次满足
+            bg_t += min(
+                p_fast - bg_t,
+                up_max_db_per_s * update_interval_s
+            )
+    elif enough_slow_samples and p_slow < bg_t:
+        bg_t -= min(
+            bg_t - p_slow,
+            down_max_db_per_s * update_interval_s
+        )
+```
+
+最后：
+
+```python
+bg_t = clamp(
+    bg_t,
+    floor_min_dbfs,
+    floor_max_dbfs
+)
+```
+
+默认：
+
+```text
+floor_min_dbfs = -80
+floor_max_dbfs = -35
+```
+
+注：`rise_trigger_db=1.0` + 连续 2 次确认 ≈ 实际延迟 0.5~1 s 才开始上升，可接受。
+上升分支优先于下降（`elif`），环境过渡期内以升起为准，避免"未跟上先回落"。
+
+---
+
+## 7. 配置
+
+在 `voice.real.vad` 下新增：
 
 ```json
-"vad": {
-  ...现有字段不变...,
-  "dynamic_floor": {
-    "enabled": false,
-    "window_s": 8.0,
-    "percentile": 10,
-    "up_max_db_per_s": 3.0,
-    "down_max_db_per_s": 0.5,
-    "gate_db": 12.0,
-    "floor_min_dbfs": -80.0,
-    "floor_max_dbfs": -35.0
-  }
+"dynamic_floor": {
+  "enabled": false,
+
+  "fast_window_s": 1.5,
+  "slow_window_s": 8.0,
+  "percentile": 10,
+
+  "update_interval_s": 0.5,
+
+  "up_max_db_per_s": 3.0,
+  "down_max_db_per_s": 0.5,
+
+  "gate_db": 12.0,
+
+  "rise_trigger_db": 1.0,
+  "rise_confirm_updates": 2,
+
+  "fast_min_frames": 20,
+  "slow_min_frames": 50,
+
+  "floor_min_dbfs": -80.0,
+  "floor_max_dbfs": -35.0
 }
 ```
 
-- `enabled=false` 时：`bg_t` 恒等于初值（现状行为，代码路径唯一化但结果等价）；
-- 旧配置（无 `dynamic_floor` 段）按 `enabled=false` 处理，**旧配置零迁移成本**。
+默认：
+
+```text
+enabled = false
+```
+
+旧配置中不存在 `dynamic_floor` 时同样按关闭处理。
 
 ---
 
-## 4. 代码变更清单
+## 8. 与现有校准、会话状态及协议边界的关系
 
-| # | 文件 | 函数/位置 | 改动 | 风险 |
-|---|---|---|---|---|
-| 1 | `engine/board_serial_asr_test.py` | `capture_until_endpoint()` 签名+帧循环 | 新增可选参数 `dynamic_floor=None`（dict）；内部 `background_dbfs` 变 `bg_t` 状态；帧循环内做门控入 ring + 每 0.5s 分位重算 + 限速钳制；阈值改每帧取 `bg_t + offset` | 低（缺省时行为等价，需回归测试） |
-| 2 | 同上 | 诊断字典 | 新增 `bg_trajectory`（每 0.5s 采样一次，供日志/状态页/CSV）、`bg_final_dbfs`、`dynamic_floor_enabled` | 无 |
-| 3 | `server/real_engine.py` | `_load_and_answer_loop()` VAD 参数解析段（~L296） | 解析 `dynamic_floor` 段并传入 `capture_until_endpoint` | 低 |
-| 4 | `server/config.json` | `voice.real.vad` | 增加 `dynamic_floor` 段（默认关） | 无 |
-| 5 | `docs/算法链路说明.md` | §2/§10 参数表 | 补动态底噪说明与参数表 | 文档 |
+### 8.1 现有校准
 
-可选（Phase 2，独立小改动）：`end_above_db` 与 `start_above_db` 解耦，端点用更保守偏移（4~6dB）——目前两者同为 3dB，说话中误截断风险偏高。此项**不属于**动态底噪必须项。
+现有：
+
+```python
+_calibrate_background()
+```
+
+保留。
+
+它只负责给：
+
+```text
+bg_t
+```
+
+提供初始值（`NoiseFloorTracker.reset(bg)`）。
+
+之后动态 estimator 根据真实音频持续调整。
+
+因此原来的：
+
+```text
+一次校准 → 全程固定
+```
+
+变成：
+
+```text
+一次校准 → 获得初值 → 每轮预语音段持续修正
+```
+
+### 8.2 协议边界（补充确认：语音开始 MIC_START，结束 MIC_STOP，本次不改）
+
+* **语音开始**：`MIC_START`（或设备本地唤醒后的等效自触发开麦）→ 设备进入 LISTENING 并上传 PCM1 帧；
+* **语音结束**：VAD 判"说完了" → 服务器发 `MIC_STOP` → 设备停止上传、UI 进 THINKING；
+* **真实帧只存在于 [MIC_START, MIC_STOP] 窗口内**；窗口之外（TTS 播报、空闲）仅有 RingBuffer 合成的 -120 dB 静音帧，无任何环境信息；
+* 因此动态底噪的学习素材 = **每轮窗口内的预语音段（用户开口前的帧）+ 说话间隙低电平帧**——正好就是估计器唯一允许更新的时段（§4）；
+* 本方案**不改变** `MIC_START`/`MIC_STOP` 的发送时机与语义，协议零改动。
+
+### 8.3 数据可得性约束（设计前提）
+
+* **回合内**：VAD 收集期间有连续真实帧 → 预语音段 + 说话间隙有素材；
+* **回合间**：见 8.2——无真实噪声信息；
+* 因此跨回合环境变化全靠"下一轮预语音段"学习——这正是 `bg_t` 会话级持有的原因；
+* 长安静期后环境已变、下一轮开口前学习窗口较短 → 由 `up_max_db_per_s=3` + 上升确认保证几秒内基本跟上；
+* 每轮失败兜底不变：`max_seconds=15s` 硬截断仍是最终防线。
 
 ---
 
-## 5. 不变的部分
+## 9. 代码改动
 
-- 起始判定（120ms/300ms 窗）、端点判定（尾静音 400ms + 4 倍抵扣）、`max_seconds=15s` 兜底逻辑；
-- `_calibrate_background()`（只改初值语义）、RingBuffer 补静音机制、`real_bytes_total` 过滤；
-- 协议（MIC_STOP/SPKS/PCM/SPKE/MIC_START）、设备端一切（WakeNet、硬件唤醒阈值 `MICS` 参数、固件）；
-- 本地串口版 V5 链路（`voice_sleep_v5_5090` 等）：因其调用 `capture_until_endpoint` 时**不传** `dynamic_floor`，行为不变。
+| 文件 | 改动 |
+| --- | --- |
+| `engine/board_serial_asr_test.py` | 新增 `NoiseFloorTracker` 类（bg_t/fast/slow ring/on_frame/bg/reset/diagnostics） |
+| 同上 | `capture_until_endpoint()` 新增 `floor_tracker=None` 参数；帧循环内调 `tracker.on_frame()`；start/end threshold 改每帧按 `tracker.bg()`（为 None 时用 `background_dbfs`，行为与现状等价） |
+| 同上 | 诊断字典新增 `bg_initial_dbfs`、`bg_final_dbfs`、`dynamic_floor_enabled`、`bg_trajectory`（由 tracker 提供） |
+| `server/real_engine.py` | `_load_and_answer_loop()`：解析 `dynamic_floor` 段；会话级创建/持有 tracker；校准完成后 `reset(bg)`；每轮传入 `capture_until_endpoint` |
+| `server/config.json` | `voice.real.vad` 新增 `dynamic_floor` 段（默认关） |
+| `docs/算法链路说明.md` | §2/§10 补动态底噪说明与参数表 |
 
----
+不动的部分：
 
-## 6. 分阶段实施计划
-
-| 阶段 | 内容 | 交付物 | 验证方式 | 预估 |
-|---|---|---|---|---|
-| **P0 回合级重估（可选、低成本）** | 每轮 MIC_START 后、用户开口前用最近 1.5s 真实帧重估 `bg`（复用现有 percentile 逻辑，只改调用时机）；与主方案可共存 | 开关 `reroll_per_turn` | 真机多轮 + 播报期间开风扇 | 0.5 天 |
-| **P1 帧级动态估计（主方案）** | §4 变更 #1~#4 | 开关默认关 + 诊断字段 | 回归：无开关时与基线逐帧一致 | 1~2 天 |
-| **P2 阈值解耦** | `end_above_db` 独立调高（4~6dB），`start_above_db` 可选调低至 2dB | config 默认值调整 | A/B | 0.5 天 |
-| **P3 A/B 验证** | 录制"安静 → 开风扇（+10dB）→ 说话 → 关风扇"连续音频，固定/动态双跑 | 对比报告 | 指标见 §7 | 1 天 |
-| **P4 默认开启 + 文档** | `enabled` 置 true、参数定稿、`算法链路说明.md` 更新 | 发布版 | 真机联调 | 0.5 天 |
-
-**P3 判定指标**（与现状基线对比）：
-
-- 误起始率（安静期噪声触发轮数 / 总时长分钟数）；
-- 端点延迟（说完 → 端点）在噪声场景下是否保持 ~400ms（现状会拉向 15s）；
-- 截断质量：speech_start_seconds / last_active_seconds 与人工标注差；
-- 漏检率：噪声+轻声场景下空轮占比；
-- `bg_trajectory` 曲线与实测底噪（人工测量）偏差 ≤ 2dB。
+* 起始判定（120 ms/300 ms 窗）、端点判定（尾静音 + 4 倍抵扣）、`max_seconds` 兜底；
+* `_calibrate_background()`、RingBuffer 补静音机制、`real_bytes_total` 过滤；
+* 协议（MIC_START/MIC_STOP/SPKS/PCM/SPKE 时序与语义）、设备端一切（WakeNet、硬件唤醒阈值 `MICS`、固件）；
+* 本地串口 V5 链路：不传 `floor_tracker` → 行为不变。
 
 ---
 
-## 7. 风险与对策
+## 10. 诊断信息
+
+至少记录：
+
+```text
+bg_initial_dbfs
+bg_final_dbfs
+dynamic_floor_enabled
+bg_trajectory
+```
+
+`bg_trajectory` 每 0.5 s 记录：
+
+```text
+time
+bg_t
+p_fast
+p_slow
+fast_candidate_count
+slow_candidate_count
+update_reason
+speech_state            ← 调参时一眼看出污染时刻
+```
+
+没必要把所有 VAD 内部变量都塞进日志。
+
+---
+
+## 11. 阈值解耦（滞回方向修正）
+
+动态 floor 第一阶段不修改：
+
+```text
+start_above_db
+end_above_db
+```
+
+先只验证底噪动态跟踪是否有效。
+
+后续如果需要做 VAD hysteresis，再单独测试：
+
+```text
+start_above_db > end_above_db
+```
+
+例如：
+
+```text
+start = +4~6 dB
+end   = +2~3 dB
+```
+
+**方向说明（修正初稿错误）**：初稿曾建议调高 `end_above_db`（4~6 dB），方向反了——endpoint
+threshold 越高，越容易把轻声尾音/清辅音/换气判成静音，导致提前截断。正确滞回方向是"进入门
+槛高、保持门槛低"：
+
+* `start` 高：抗噪声误起始；
+* `end` 低：容忍轻声尾音，防提前截断；
+* 噪声抗性不再依赖偏移量，而由动态底噪承担——这正是动态底噪稳定后（P4）再解耦的前提。
+
+---
+
+## 12. 实施阶段
+
+### P0 基线（已完成提交，待归档回归素材）
+
+* 现有版本基线已提交（`c637380`）；
+* 回归素材基本免费：`voice_server_full/server/runs/*/audio/qa_*.wav`（每轮输入音频已落盘）
+  + `voice_qa_results.csv` + 日志中每轮 VAD 诊断（`endpoint_triggered / speech_start_seconds /
+  trailing_silence_ms / vad_threshold_dbfs`）；
+* 归档一份"固定 PCM 集 + 当前 VAD 输出"作为 regression baseline；
+* 建议制作一张拼接 wav（安静 3 s → 风扇 5 s → 说话 → 关风扇），回放/回归/A-B/调参四用，
+  经 `board_simulator.py --scenario voice`（`voice_wav` 路径可换）驱动。
+
+### P1 动态 floor 框架
+
+* 实现 §9 全部改动：`NoiseFloorTracker`、`dynamic_floor` 参数、诊断字段；
+* 默认关闭；
+* 验收：`dynamic_floor=false` 时与当前版本输出一致（逐帧/逐轮回归）；
+* 预估：1~2 天。
+
+### P2 开启动态 floor
+
+* 使用固定 PCM A/B：
+
+```text
+fixed floor
+vs
+dynamic floor
+```
+
+重点测试：
+
+```text
+安静 → 开风扇 → 说话
+```
+
+以及：
+
+```text
+开风扇 → 关风扇 → 轻声说话
+```
+
+### P3 参数调整
+
+根据 A/B 调整：
+
+```text
+fast_window_s
+gate_db
+up_max_db_per_s
+down_max_db_per_s
+rise_trigger_db
+```
+
+### P4 阈值解耦
+
+只有动态 floor 稳定后，再按 §11 调整 start/end threshold。
+
+---
+
+## 13. 验证指标
+
+重点只看四项：
+
+### 误起始率
+
+```text
+无语音区间 false speech start 次数 / 分钟
+```
+
+### Endpoint delay
+
+```text
+VAD endpoint - 人工标注真实语音结束
+```
+
+### Timeout rate
+
+```text
+15 s timeout rounds / total rounds
+```
+
+### 漏检 / 截断
+
+检查：
+
+* 轻声是否漏掉；
+* 开头是否丢失；
+* 尾字是否提前截断。
+
+辅助观察（P3 调参主指标）：
+
+```text
+bg_trajectory 是否合理跟随环境变化;
+底噪恢复时间: bg_t 与人工/实测底噪差 ≤ 2 dB 所需秒数
+```
+
+---
+
+## 14. 预期效果
+
+最终逻辑：
+
+```text
+_calibrate_background()
+        ↓
+      bg 初值
+        ↓
+     dynamic bg_t
+      ↙       ↘
+fast window   slow window
+噪声上升      噪声下降
+      ↘       ↙
+        bg_t
+         ↓
+动态 start/end threshold
+         ↓
+现有 VAD 状态机
+```
+
+核心原则：
+
+> **不重写 VAD，只把固定底噪参考值变成动态底噪参考值。**
+
+---
+
+## 15. 风险与对策
 
 | 风险 | 等级 | 对策 |
-|---|---|---|
-| 语音污染：语音帧抬高底噪 → 尾字截断/端点提前 | **高** | 门控（仅低于阈值帧入 ring）+ 10% 分位（语音占比 <50% 时天然安全）+ 上升限速 3dB/s（语音即使漏进门控，推动力也受限） |
-| 环境突变（风扇突开 +10dB）后几秒盲区 | 中 | 上升限速放宽至 3dB/s；P0 回合级重估兜底；`max_seconds` 硬截断仍是最低层防线 |
-| 合成静音帧（-120dB）拉低底噪 | 中 | 已由 `> -100dB` + `real_bytes_total` 双重排除（现有校准同款逻辑） |
-| 多轮/长会话漂移累积 | 低 | 每轮起始前帧自动学习；P0 兜底 |
-| 回归风险（开关关闭时行为漂移） | 低 | P1 交付前做"开关关 vs 现状"逐帧一致性回归；P4 才默认开 |
-
----
-
-## 8. 明确不做的事
-
-- 不改设备本地唤醒逻辑（`set_hardware_sleep`/`MICS` 硬件阈值）——那是另一套机制，与服务器 VAD 解耦，本次不联动；
-- 不做噪声抑制/降噪（NS）、不做模型类 VAD（WeNet/Silero 等）——本方案是能量域改造，若后续要 AEC/降噪再单独立项；
-- 不动 `network/`（旧快照目录）——只改 `voice_server_full/`。
+| --- | --- | --- |
+| 语音污染抬高底噪 → 尾字截断/端点提前 | 高 | fast 只在预语音段更新（结构性排除）+ 上升确认 + 3 dB/s 限速；slow 另有 gate + 0.5 dB/s 限速 |
+| 噪声突变超过 gate_db 后底噪不升（gate 悖论） | 高 | 修正 B：fast 窗口不套 gate，只排合成静音帧；污染改由更新时机防护（已并入 §4，属本稿设计而非待调参数） |
+| 说话中途噪声突升（风扇在对话中打开） | 中 | 本轮行为与现状相同（最多一次 15 s 封顶）；下一轮预语音段快速重锚底噪，后续轮恢复——严格优于现状的"每轮都坏"；`max_seconds` 兜底不变 |
+| 合成静音帧（-120 dB）拉低底噪 | 中 | fast/slow 均要求 `frame_dbfs > -100` 排除；`real_bytes_total` 判定真实帧双保险 |
+| 跨回合状态失效（每轮从初值重来） | 高 | 修正 A：`NoiseFloorTracker` 会话级持有（已并入 §2/§8） |
+| 回归风险（关闭时行为漂移） | 低 | `floor_tracker=None` 走原路径；P1 验收含"关闭时逐帧一致"回归；P4 才默认开 |
