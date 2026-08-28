@@ -338,6 +338,7 @@ def capture_until_endpoint(
     sr=16000,
     on_chunk=None,
     floor_tracker=None,
+    stop_event=None,
 ):
     """能量 VAD 主函数:边收帧边判定"人开始说话了吗 / 人说完了吗",输出整段语音。
 
@@ -394,6 +395,10 @@ def capture_until_endpoint(
     floor_epoch = time.monotonic()
 
     while total_samples < max_samples:
+        # early-stop 挂点:on_chunk 回调(如流式唤醒判定命中)置位后,下一帧即提前结束 ——
+        # 用于"检测到目标即可不再等段尾"的场景(唤醒命中即时响应)。
+        if stop_event is not None and stop_event.is_set():
+            break
         _, board_dbfs, frame = read_frame(ser)
         remaining = max_samples - total_samples
         frame = frame[:remaining]

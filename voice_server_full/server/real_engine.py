@@ -424,6 +424,17 @@ class RealVoiceEngine:
             # 命中"你好小科" → 播唤醒应答 → 丢弃应答期间上行(含扬声器回声,无AEC) →
             # MIC_START(设备→LISTEN) → 进入唤醒态;未命中继续守听(不发任何下行命令)。
             if self._wake_enabled and not self._awake:
+                # 流式增量唤醒判定(600ms 块粒度,检测频率高):边说边识,命中即 early-stop;
+                # 未命中再整段识别兜底(块边界跨字等罕见情形)。段上限 wk_listen_s 默认 3s。
+                w_asr = StreamingAsr(asr)
+                w_hit = threading.Event()
+
+                def _wake_chunk(block):
+                    w_asr.on_chunk(block)
+                    if any(n in _normalize_wake("".join(w_asr.parts))
+                           for n in self._wake_needles):
+                        w_hit.set()
+
                 try:
                     w_samples, _, w_ep = capture_until_endpoint(
                         self.stream, max_seconds=wk_listen_s,
@@ -435,6 +446,8 @@ class RealVoiceEngine:
                         voice_start_ms=wk_start_ms,
                         voice_start_window_ms=wk_window_ms,
                         floor_tracker=self._floor,
+                        on_chunk=_wake_chunk,
+                        stop_event=w_hit,
                     )
                 except TimeoutError:
                     self._real_bytes_consumed = self.stream.real_bytes_total
@@ -442,17 +455,24 @@ class RealVoiceEngine:
                 self._real_bytes_consumed = self.stream.real_bytes_total
                 if not w_ep.get("speech_started") or len(w_samples) < 1600:
                     continue                      # 环境静音/极短段:不识别,继续守听
-                # 只识别"起始回退后→段尾"的有效语音段 —— 整段喂 ASR 时,开头长静音会被
-                # 流式切块吞掉前缀字(实测"你好小科"只识别出"小科");与串口版
-                # "保留触发首帧/pre-roll 作为唤醒段一部分"的做法等价。
-                w_si = int(float(w_ep.get("speech_start_seconds") or 0.0) * 16000)
-                w_seg = w_samples[w_si:] if 0 < w_si < len(w_samples) else w_samples
-                wake_text, _, wk_asr_s = recognize(asr, w_seg)
-                wake_text = (wake_text or "").strip()
-                value = _normalize_wake(wake_text)
-                self._remember(f"WAKE? {wake_text or '[空]'}")
-                print(f"[唤醒] 候选识别({wk_asr_s:.2f}s): {wake_text!r}", flush=True)
-                if any(n in value for n in self._wake_needles):
+                if w_hit.is_set():
+                    # 流式快速路:parts 已提前含唤醒词 → 不等段尾,立即结束并冲刷确认
+                    wake_text, _, _ = w_asr.finish(w_samples)
+                    wake_text = (wake_text or "").strip()
+                    self._remember(f"WAKE? {wake_text or '[空]'}")
+                    print(f"[唤醒] 流式命中(段={round(len(w_samples) / 16000, 2)}s): "
+                          f"{wake_text[:40]!r}", flush=True)
+                    hit = True
+                else:
+                    # 常规路径:finish 冲刷尾巴(is_final)拼出完整文本 —— on_chunk 非 final
+                    # 块文本不完整(词尾滞后),必须 flush;同块边界下与 recognize() 等价。
+                    wake_text, _, wk_asr_s = w_asr.finish(w_samples)
+                    wake_text = (wake_text or "").strip()
+                    value = _normalize_wake(wake_text)
+                    self._remember(f"WAKE? {wake_text or '[空]'}")
+                    print(f"[唤醒] 候选识别({wk_asr_s:.2f}s): {wake_text!r}", flush=True)
+                    hit = any(n in value for n in self._wake_needles)
+                if hit:
                     print(f"[唤醒] 命中唤醒词 → 应答: {self._wake_prompt!r}", flush=True)
                     self._remember(f"WAKE+ {wake_text}")
                     if self._wake_prompt:

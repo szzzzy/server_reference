@@ -125,7 +125,7 @@ async def main():
     t2b, _ = await collect_until(ws, "MIC_START", 8.0, "phase2b")
     seq2b = [t for _, t in t2b]
     check("P2b 持续对话: SPKE 后收到 MIC_START(无需重新说唤醒词)",
-          seq2b and seq2b[-1] == "MIC_START",
+          bool(seq2b) and seq2b[-1] == "MIC_START",
           f"seq={seq2b}")
 
     # ---- P5 半双工:回声免疫 —— SPKE 后必须无第二轮 MIC_STOP(否则=自问自答) ----
