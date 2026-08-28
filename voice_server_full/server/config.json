@@ -91,7 +91,23 @@
         "start_window_ms": 300,
         "endpoint_ms": 400,
         "max_seconds": 15,
-        "active_penalty": 4.0
+        "active_penalty": 4.0,
+        "dynamic_floor": {
+          "enabled": false,
+          "fast_window_s": 1.5,
+          "slow_window_s": 8.0,
+          "percentile": 10,
+          "update_interval_s": 0.5,
+          "up_max_db_per_s": 3.0,
+          "down_max_db_per_s": 0.5,
+          "gate_db": 12.0,
+          "rise_trigger_db": 1.0,
+          "rise_confirm_updates": 2,
+          "fast_min_frames": 20,
+          "slow_min_frames": 50,
+          "floor_min_dbfs": -80.0,
+          "floor_max_dbfs": -35.0
+        }
       }
     }
   }

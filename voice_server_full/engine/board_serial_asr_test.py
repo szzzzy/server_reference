@@ -14,6 +14,7 @@
 # 调用方: server/real_engine.py(服务器 real 模式)、voice_daemon.py(本地 V5)。
 # ============================================================================
 import argparse
+from collections import deque
 import csv
 import math
 import struct
@@ -80,6 +81,144 @@ def active_voice_dbfs(samples, background_dbfs, sr=16000, frame_ms=20, threshold
             active_count += 1
     active_samples = np.concatenate(active) if active else np.array([], dtype=np.int16)
     return rms_dbfs(active_samples), (active_count / frame_count if frame_count else 0.0)
+
+
+class NoiseFloorTracker:
+    """动态底噪估计器(方案:双时间尺度,把固定背景电平换成随环境变化的 bg_t)。
+
+    设计要点:
+      - fast 窗(fast_window_s,默认1.5s):最近*全部真实帧*的 percentile 分位 → 环境变吵快速跟随;
+        关键:不套 gate(修正 B)—— 风扇/空调噪声常比底噪高 15~20dB,若按"低于 bg_t+gate_db"
+        过滤则噪声帧永远进不了估计器,底噪永不上升;
+      - slow 窗(slow_window_s,默认8s):最近"低于 bg_t+gate_db"的候选帧分位 → 稳定跟踪与回落;
+      - 语音污染防护:仅 speech_started=False(每轮预语音段)时帧才入 ring 且才允许更新;
+        speech_started 置位后本轮冻结 —— 语音结构性进不了估计器;
+      - 上升需连续 rise_confirm_updates 次确认 + up_max_db_per_s 限速;下降 down_max_db_per_s
+        限速(慢),避免语音间隙被当噪声;整体钳制在 [floor_min_dbfs, floor_max_dbfs]。
+
+    用法(与 VAD 状态机解耦,本地串口 V5 链路亦可复用):
+      tracker = NoiseFloorTracker(init_bg_dbfs, cfg_dict)
+      for frame in ...:
+          tracker.on_frame(rms_dbfs(frame), speech_started)
+      threshold = tracker.bg() + offset        # 每帧阈值
+      tracker.reset(bg)                        # 会话内成功校准后重设初值
+      tracker.diagnostics()                    # bg_initial/final/bg_trajectory...
+    """
+
+    def __init__(self, init_bg_dbfs, cfg=None):
+        cfg = cfg or {}
+        self.cfg = {
+            "fast_window_s": float(cfg.get("fast_window_s", 1.5)),
+            "slow_window_s": float(cfg.get("slow_window_s", 8.0)),
+            "percentile": float(cfg.get("percentile", 10.0)),
+            "update_interval_s": float(cfg.get("update_interval_s", 0.5)),
+            "up_max_db_per_s": float(cfg.get("up_max_db_per_s", 3.0)),
+            "down_max_db_per_s": float(cfg.get("down_max_db_per_s", 0.5)),
+            "gate_db": float(cfg.get("gate_db", 12.0)),
+            "rise_trigger_db": float(cfg.get("rise_trigger_db", 1.0)),
+            "rise_confirm_updates": int(cfg.get("rise_confirm_updates", 2)),
+            "fast_min_frames": int(cfg.get("fast_min_frames", 20)),
+            "slow_min_frames": int(cfg.get("slow_min_frames", 50)),
+            "floor_min_dbfs": float(cfg.get("floor_min_dbfs", -80.0)),
+            "floor_max_dbfs": float(cfg.get("floor_max_dbfs", -35.0)),
+        }
+        self._bg = float(init_bg_dbfs)
+        self._bg_initial = float(init_bg_dbfs)
+        self._fast = deque()            # (ts, dbfs):最近 fast_window_s 的真实帧(不套 gate)
+        self._slow = deque()            # (ts, dbfs):最近 slow_window_s 的低电平候选帧(套 gate)
+        self._last_update = None
+        self._rise_pending = 0
+        self._traj = deque(maxlen=1200)  # bg_trajectory 环形保留(防长会话内存膨胀)
+
+    def reset(self, bg_dbfs):
+        """重校准:更新初值并清空全部状态(引擎 _calibrate_background 成功后调用)。"""
+        self._bg = float(bg_dbfs)
+        self._bg_initial = float(bg_dbfs)
+        self._fast.clear()
+        self._slow.clear()
+        self._last_update = None
+        self._rise_pending = 0
+        self._traj.clear()
+
+    def bg(self):
+        """当前底噪估计(dBFS);VAD 每帧阈值 = bg() + offset。"""
+        return self._bg
+
+    def on_frame(self, frame_dbfs, speech_started=False, ts=None):
+        """每 20ms 帧调用一次(仅预语音段生效;进入语音后本轮冻结)。
+
+        frame_dbfs: 该帧服务器侧 rms_dbfs;speech_started: VAD 是否已判"开始说话"。
+        ts: 时间戳(秒),默认 time.monotonic();调试/回放校验时可注入模拟时间。
+        -120dB(合成静音帧/无真实数据)直接忽略,避免把 RingBuffer 补的静音当成低噪声。
+        """
+        if frame_dbfs <= -100.0:
+            return                                    # 合成静音帧或静默:无环境信息
+        if speech_started:
+            return                                    # 冻结:语音帧结构性排除
+        ts = time.monotonic() if ts is None else float(ts)
+        self._fast.append((ts, frame_dbfs))
+        if frame_dbfs < self._bg + self.cfg["gate_db"]:
+            self._slow.append((ts, frame_dbfs))
+        if self._last_update is None or ts - self._last_update >= self.cfg["update_interval_s"]:
+            self._update(ts)
+
+    def _update(self, ts):
+        c = self.cfg
+        prev_update = self._last_update
+        self._last_update = ts
+        # 确认计数跨冻结期失效:距上次更新超过 2.5 个更新周期(回合已被语音冻结/隔断),
+        # 清零重来,保持"连续 2 次"的语义
+        if prev_update is not None and ts - prev_update > c["update_interval_s"] * 2.5:
+            self._rise_pending = 0
+        self._prune(ts)
+        fast = [d for _, d in self._fast]
+        slow = [d for _, d in self._slow]
+        p_fast = (float(np.percentile(fast, c["percentile"]))
+                  if len(fast) >= c["fast_min_frames"] else None)
+        p_slow = (float(np.percentile(slow, c["percentile"]))
+                  if len(slow) >= c["slow_min_frames"] else None)
+        reason = "none"
+        if p_fast is not None and p_fast > self._bg + c["rise_trigger_db"]:
+            # 上升:连续 2 次确认后进入"持续上升"状态(不重置计数),此后每个周期按限速
+            # 继续抬升,直到条件不再满足(由 else 清零);限速防语音污染推动过快
+            self._rise_pending += 1
+            if self._rise_pending >= c["rise_confirm_updates"]:
+                step = min(p_fast - self._bg, c["up_max_db_per_s"] * c["update_interval_s"])
+                self._bg = min(max(self._bg + step, c["floor_min_dbfs"]), c["floor_max_dbfs"])
+                reason = "rise"
+        elif p_slow is not None and p_slow < self._bg:
+            # 下降:慢速回落(下降信号可能来自语音间隙/换气,限速保护)
+            self._rise_pending = 0
+            step = min(self._bg - p_slow, c["down_max_db_per_s"] * c["update_interval_s"])
+            self._bg = min(max(self._bg - step, c["floor_min_dbfs"]), c["floor_max_dbfs"])
+            reason = "fall"
+        else:
+            self._rise_pending = 0
+        self._traj.append({
+            "t": round(ts, 3),
+            "bg": round(self._bg, 2),
+            "p_fast": round(p_fast, 2) if p_fast is not None else None,
+            "p_slow": round(p_slow, 2) if p_slow is not None else None,
+            "fast_n": len(fast),
+            "slow_n": len(slow),
+            "reason": reason,
+        })
+
+    def _prune(self, ts):
+        """按真实时间窗清理(ring 存时间戳而非 maxlen —— 窗口语义是"最近 N 秒")。"""
+        c = self.cfg
+        while self._fast and ts - self._fast[0][0] > c["fast_window_s"]:
+            self._fast.popleft()
+        while self._slow and ts - self._slow[0][0] > c["slow_window_s"]:
+            self._slow.popleft()
+
+    def diagnostics(self):
+        return {
+            "dynamic_floor_enabled": True,
+            "bg_initial_dbfs": round(self._bg_initial, 2),
+            "bg_final_dbfs": round(self._bg, 2),
+            "bg_trajectory": list(self._traj),
+        }
 
 
 def checksum8(data):
@@ -190,6 +329,7 @@ def capture_until_endpoint(
     voice_start_window_ms=None,
     sr=16000,
     on_chunk=None,
+    floor_tracker=None,
 ):
     """能量 VAD 主函数:边收帧边判定"人开始说话了吗 / 人说完了吗",输出整段语音。
 
@@ -203,6 +343,9 @@ def capture_until_endpoint(
       voice_start_ms                起始滑动窗内活跃样本需达到的毫秒数(防单次尖峰误触发)
       voice_start_window_ms         起始滑窗长度(默认=voice_start_ms;检测到说话时录音起点回退
                                     到窗口起点,保证第一个字不被切掉 —— 关键预处理)
+      floor_tracker                 NoiseFloorTracker 实例(动态底噪,默认 None=固定底噪,行为不变)。
+                                    非 None 时每帧喂给估计器,start/end 阈值随 bg_t 变化:
+                                    speech_started 前估计器持续更新,判定开始后本轮冻结。
 
     起始检测:读帧 → 帧内活跃样本计数 → 300ms 滑窗(窗口滚出则扣除) →
       活跃样本 ≥ 120ms → speech_started=True,并把 speech_start_sample 回退到窗口起点。
@@ -211,7 +354,7 @@ def capture_until_endpoint(
       静音帧则累加计数,攒够 endpoint_silence_ms 即 endpoint_triggered=True。
     返回: (captured int16 数组[整段含末尾静音+开头预卷], 每帧板卡侧 dBFS 列表,
            endpoint 诊断字典[speech_started/endpoint_triggered/各阈值/
-           trailing_silence_ms/speech_start_seconds/...供日志与调参])
+           动态底噪 bg_initial/bg_final/bg_trajectory/...供日志与调参])
     """
     # 流式 ASR(可选):on_chunk 非 None 时,每凑满 600ms(9600 样本=30 帧)切一块回调,
     # 供"边说边识别";默认 None 行为与旧版完全一致(本地 V5 等调用者零影响)。
@@ -249,6 +392,14 @@ def capture_until_endpoint(
         frame_dbfs = rms_dbfs(frame)
         dbfs_frames.append(board_dbfs)
         total_samples += len(frame)
+        # ---- 动态底噪(可选):每帧喂给估计器,speech_started 前持续更新; ------------
+        # 按最新 bg_t 重算本帧阈值(两次加法,零额外成本);floor_tracker=None 时
+        # bg_t 恒为 background_dbfs,与旧版行为完全一致。
+        if floor_tracker is not None:
+            floor_tracker.on_frame(frame_dbfs, speech_started)
+            bg_now = floor_tracker.bg()
+            start_threshold_dbfs = bg_now + threshold_above_bg
+            endpoint_threshold_dbfs = bg_now + endpoint_threshold_above_bg
         # ---- 流式 ASR 挂点:每凑满 600ms(9600 样本 = 30 帧)切一块,立即回调增量识别 ----
         # 块边界与 recognize() 完全一致(从第一帧起每 9600 样本);on_chunk=None 时零开销。
         if on_chunk is not None:
@@ -293,7 +444,7 @@ def capture_until_endpoint(
             break
 
     captured = np.concatenate(samples) if samples else np.array([], dtype=np.int16)
-    return captured, dbfs_frames, {
+    diag = {
         "endpoint_triggered": endpoint_triggered,
         "speech_started": speech_started,
         "vad_threshold_dbfs": start_threshold_dbfs,
@@ -310,6 +461,14 @@ def capture_until_endpoint(
             if last_active_sample is not None else ""
         ),
     }
+    if floor_tracker is not None:
+        diag.update(floor_tracker.diagnostics())
+    else:
+        diag["dynamic_floor_enabled"] = False
+        diag["bg_initial_dbfs"] = round(background_dbfs, 2)
+        diag["bg_final_dbfs"] = round(background_dbfs, 2)
+        diag["bg_trajectory"] = []
+    return captured, dbfs_frames, diag
 
 
 def save_wav(path, samples, sr=16000):

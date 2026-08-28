@@ -136,6 +136,7 @@ class RealVoiceEngine:
         self._real_bytes_consumed = 0         # 已消费的真实字节数(校准/识别循环的记录游标)
         self._background_dbfs = None        # None=未校准;校准成功为实测背景
         self._calibration_done = False
+        self._floor = None                  # 动态底噪估计器(会话级;None=未启用/固定底噪)
         self._board_spks_active = False     # 下行 SPKS 是否已开(跨段连续播)
         self._first_spks_at = None          # 本轮首块音频下发的时刻(端点→首块计时用)
         self._turn_first_frame_at = None    # 本轮第一帧到达时刻(完整链路计时起点)
@@ -264,7 +265,8 @@ class RealVoiceEngine:
         from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
         from asr_eval_core import load_paraformer
         from board_serial_asr_test import (
-            capture_seconds, capture_until_endpoint, recognize, rms_dbfs, save_wav,
+            NoiseFloorTracker, capture_seconds, capture_until_endpoint, recognize,
+            rms_dbfs, save_wav,
         )
         from realtime_pipeline import resolve, start_tts_worker
 
@@ -310,6 +312,20 @@ class RealVoiceEngine:
         default_background = float(vad.get("background_dbfs", -60))
         background_seconds = float(
             vc.get("background_seconds", vad.get("background_seconds", 2.5)))
+        # ---- 动态底噪:双窗估计器(默认关闭;enabled=false 时 _floor=None,完全走原路径) ----
+        df_cfg = vad.get("dynamic_floor")
+        df_cfg = df_cfg if isinstance(df_cfg, dict) else {}
+        if df_cfg.get("enabled", False):
+            self._floor = NoiseFloorTracker(default_background, df_cfg)
+            log.info("动态底噪: 启用 (fast=%.1fs slow=%.1fs gate=%.1fdB 升%.1fdB/s 降%.1fdB/s 触发%.1fdB)",
+                     float(df_cfg.get("fast_window_s", 1.5)),
+                     float(df_cfg.get("slow_window_s", 8.0)),
+                     float(df_cfg.get("gate_db", 12.0)),
+                     float(df_cfg.get("up_max_db_per_s", 3.0)),
+                     float(df_cfg.get("down_max_db_per_s", 0.5)),
+                     float(df_cfg.get("rise_trigger_db", 1.0)))
+        else:
+            self._floor = None
         # 语音流停止后,在端点静音窗口内自动补静音帧,让现有 VAD 端点逻辑生效
         self.stream.enable_auto_silence(endpoint_ms / 1000.0 + 0.4)
 
@@ -339,18 +355,22 @@ class RealVoiceEngine:
                     voice_start_ms=voice_start_ms,
                     voice_start_window_ms=voice_start_window_ms,
                     on_chunk=asr_stream.on_chunk,
+                    floor_tracker=self._floor,
                 )
             except TimeoutError:
                 self._real_bytes_consumed = self.stream.real_bytes_total
                 continue
             self._real_bytes_consumed = self.stream.real_bytes_total
-            log.info("VAD: 端点触发=%s 起始=%.2fs 最后活跃=%.2fs 尾静音=%sms 阈值=%.1fdB 音频=%.2fs",
+            bg_extra = (f" | 动态底噪bg={float(endpoint.get('bg_final_dbfs') or background_dbfs):.1f}dB"
+                        if self._floor is not None else "")
+            log.info("VAD: 端点触发=%s 起始=%.2fs 最后活跃=%.2fs 尾静音=%sms 阈值=%.1fdB 音频=%.2fs%s",
                      bool(endpoint.get("endpoint_triggered")),
                      float(endpoint.get("speech_start_seconds") or 0.0),
                      float(endpoint.get("last_active_seconds") or 0.0),
                      int(endpoint.get("trailing_silence_ms") or 0),
                      float(endpoint.get("vad_threshold_dbfs") or background_dbfs),
-                     round(len(samples) / 16000, 2))
+                     round(len(samples) / 16000, 2),
+                     bg_extra)
             # ---- 协议适配(ESP32 Julia "听—想—说"):
             # VAD 判定本轮输入结束 → 立即回发独立的 MIC_STOP 文本帧(不能省略),
             # 设备收到后结束上传、UI 进入 THINKING;然后服务器才做 ASR/LLM/TTS。
@@ -476,6 +496,9 @@ class RealVoiceEngine:
             if -85.0 < bg < -40.0:
                 self._background_dbfs = bg
                 self._calibration_done = True
+                # 动态底噪:校准结果作为 bg_t 初值,此后由估计器持续修正
+                if self._floor is not None:
+                    self._floor.reset(bg)
                 log.info("背景校准: %.1f dBFS (%.1fs 真实音频, 帧电平10%%分位, 第%d次)",
                          bg, seconds, attempt)
                 return
