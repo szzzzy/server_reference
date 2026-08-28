@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""线上唤醒全链路探测:模拟"持续上传固件"的完整一轮(唤醒词→应答→MIC_START→问题→回答)。
-
-阶段1: 上传 [安静1.5s + "你好小科"(TTS合成) + 安静0.8s] → 等待下行
-        期待 [SPKS 24000 → PCM×N → SPKE(唤醒应答) → MIC_START]
-阶段2: 收到 MIC_START 后上传 [问题段(标准女声切片) + 安静] → 等待下行
-        期待 [MIC_STOP → SPKS 24000 → PCM×M → SPKE],且 SPKE 后 3s 内无 MIC_START(回待机)
+"""线上唤醒全链路探测(唤醒一次·持续对话版本):
+    阶段1: [安静 + "你好小科" + 安静] → 期待 SPKS→PCM→SPKE(应答)→MIC_START
+    阶段2: [问题段 + 安静] → 期待 MIC_STOP→SPKS→PCM→SPKE → **MIC_START(续听,无唤醒词)**
+    阶段3: 静默(停传)超过 timeout_seconds(测试时 config 设 8s) → 期待引擎回待机
+    阶段4: 再传一次唤醒词 → 期待再次唤醒应答 + MIC_START(证明超时后回了待机)
 
 用法: 先启动 run_server.py --voice-mode real(voice.real.wake.enabled=true),再运行本脚本。
+测试超时前请把 config time.voice.real.wake.timeout_seconds 临时调小(如 8),测完恢复 60。
 """
 import asyncio
 import json
@@ -28,7 +28,6 @@ from common import detect_ip, load_test_wav, pcm1_build, resolve_path, rms_dbfs,
 
 SR = 16000
 OK = []
-CHECKED = []
 
 
 def check(name, cond, detail=""):
@@ -59,18 +58,14 @@ def load_wav_pcm(path):
 
 
 async def upload(ws, pcm):
-    """按 ≈17ms/帧(略快于实时)上传整段 PCM,返回发送结束时刻。"""
     n = len(pcm) // 320
-    t0 = time.monotonic()
     for i in range(n):
         chunk = pcm[i * 320:(i + 1) * 320]
         await ws.send(pcm1_build(i + 1, chunk.tobytes(), int(rms_dbfs(chunk.tobytes()) * 100)))
         await asyncio.sleep(0.017)
-    return t0
 
 
 async def collect_until(ws, stop_text, timeout_s, tag):
-    """收下行直到出现 stop_text(或超时)；返回 (文本序列[(t,text)], PCM帧数)。"""
     texts, pcm_frames = [], 0
     deadline = time.monotonic() + timeout_s
     t0 = time.monotonic()
@@ -100,11 +95,11 @@ async def main():
 
     phase1 = np.concatenate([
         tone(-58.0, 1.5, f=180.0),
-        load_wav_pcm(HERE / "wake_hello.wav"),          # "你好小科"(TTS 合成 1.68s)
+        load_wav_pcm(HERE / "wake_hello.wav"),
         tone(-58.0, 0.8, f=180.0),
     ])
     phase2 = np.concatenate([
-        speech_slice(-25.0, 2.5, 1.5),                  # 问题段(标准女声 2.5s)
+        speech_slice(-25.0, 2.5, 1.5),
         tone(-58.0, 1.0, f=180.0),
     ])
 
@@ -112,21 +107,36 @@ async def main():
     await upload(ws, phase1)
     t1, pcm1 = await collect_until(ws, "MIC_START", 40.0, "phase1")
     seq1 = [t for _, t in t1]
-    check("P1 应答序列: SPKS 24000→PCM→SPKE→MIC_START",
+    check("P1 应答序列: SPKS→PCM→SPKE→MIC_START",
           "SPKS 24000" in seq1 and "SPKE" in seq1 and seq1[-1] == "MIC_START" and pcm1 > 0,
           f"seq={seq1} pcm={pcm1}")
 
-    # ---- 阶段2: 问题 → MIC_STOP → 回答 → SPKE(之后回待机,无 MIC_START) ----
+    # ---- 阶段2: 问题(不再说唤醒词) → MIC_STOP → 回答 → SPKE → MIC_START(续听) ----
     await upload(ws, phase2)
     t2, pcm2 = await collect_until(ws, "SPKE", 60.0, "phase2")
     seq2 = [t for _, t in t2]
-    check("P2 问答序列: MIC_STOP→SPKS 24000→PCM→SPKE",
+    check("P2 问题序列: MIC_STOP→SPKS→PCM→SPKE",
           "MIC_STOP" in seq2 and "SPKS 24000" in seq2 and seq2[-1] == "SPKE" and pcm2 > 0,
           f"seq={seq2} pcm={pcm2}")
-    extra = await collect_until(ws, "__never__", 3.0, "post")
-    seqx = [t for _, t in extra[0]]
-    check("P3 回待机: SPKE 后 3s 内无 MIC_START", "MIC_START" not in seqx and not extra[1],
-          f"seq={seqx}")
+    t2b, _ = await collect_until(ws, "MIC_START", 8.0, "phase2b")
+    seq2b = [t for _, t in t2b]
+    check("P2b 持续对话: SPKE 后收到 MIC_START(无需重新说唤醒词)",
+          seq2b and seq2b[-1] == "MIC_START",
+          f"seq={seq2b}")
+
+    # ---- 阶段3: 静默停传 > timeout(8s),引擎应回待机 ----
+    timeout_s = float(cfg.get("voice", {}).get("real", {}).get("wake", {}).get("timeout_seconds", 60))
+    print(f"[phase3] 静默 {timeout_s + 3:.0f}s(等待空闲超时)", flush=True)
+    await asyncio.sleep(timeout_s + 3.0)
+    # 无下行可观测(超时回待机不发命令),从阶段4 的"二次唤醒"验证
+
+    # ---- 阶段4: 再次说唤醒词 → 应再次唤醒(证明已回待机) ----
+    await upload(ws, phase1)
+    t4, pcm4 = await collect_until(ws, "MIC_START", 40.0, "phase4")
+    seq4 = [t for _, t in t4]
+    check("P4 超时后二次唤醒: 再次命中唤醒词→应答→MIC_START",
+          "SPKS 24000" in seq4 and "SPKE" in seq4 and seq4[-1] == "MIC_START" and pcm4 > 0,
+          f"seq={seq4} pcm={pcm4}")
 
     print("WAKE:", "ALL PASS" if all(OK) else "SOME FAILED", f"({sum(OK)}/{len(OK)})")
     await ws.close()

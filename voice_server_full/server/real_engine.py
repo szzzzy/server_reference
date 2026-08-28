@@ -363,14 +363,18 @@ class RealVoiceEngine:
         for _w in self._wake_words:
             self._wake_needles |= _wake_variants(_normalize_wake(_w))
         self._wake_prompt = str(wk_cfg.get("prompt", "我在，请讲。") or "")
+        # 唤醒一次·持续对话: 唤醒后不回待机,仅空闲超时(无"判了起始"的段)才回待机
+        wk_timeout_s = float(wk_cfg.get("timeout_seconds", 60.0) or 0.0)
         # 待机判定参数(串口版 V5 唤醒段同款:起声快、端点短、段上限小)
         wk_listen_s = float(wk_cfg.get("listen_seconds", 8.0))
         wk_endpoint_ms = float(wk_cfg.get("endpoint_silence_ms", 500))
         wk_start_ms = int(wk_cfg.get("start_active_ms", 20))
         wk_window_ms = int(wk_cfg.get("start_window_ms", 500))
         self._awake = False
+        self._awake_at = 0.0
         if self._wake_enabled:
-            log.info("线上唤醒: 启用 (词=%s 应答=%r)", self._wake_words, self._wake_prompt)
+            log.info("线上唤醒: 启用 (词=%s 应答=%r 空闲超时=%.0fs)",
+                     self._wake_words, self._wake_prompt, wk_timeout_s)
         # 语音流停止后,在端点静音窗口内自动补静音帧,让现有 VAD 端点逻辑生效
         self.stream.enable_auto_silence(endpoint_ms / 1000.0 + 0.4)
 
@@ -381,6 +385,14 @@ class RealVoiceEngine:
 
         while not self._stop.is_set():
             self._short_sleep(0.2)
+            # ---- 唤醒态空闲超时(唯一退出条件): 持续对话时 60s 无活动段 → 回待机等下次唤醒词。
+            #     放在最外层(等字节之前):即使设备停传/无新字节也要计时;不发任何下行命令
+            #     (设备侧 LISTEN/IDLE 由固件 5 分钟远场待机自愈,PCM 不受影响)。
+            if (self._wake_enabled and self._awake and wk_timeout_s > 0
+                    and time.monotonic() - self._awake_at > wk_timeout_s):
+                print(f"[唤醒] 空闲 {wk_timeout_s:.0f}s 无交互 → 回待机(等下次唤醒词)", flush=True)
+                self._remember("WAKE- timeout")
+                self._awake = False
             if self.stream.real_bytes_total <= self._real_bytes_consumed:
                 continue
             if not self._calibration_done and self._floor is None:
@@ -440,6 +452,7 @@ class RealVoiceEngine:
                     self._push_text("MIC_START")
                     print("[下行] MIC_START(线上唤醒→LISTEN)", flush=True)
                     self._awake = True
+                    self._awake_at = time.monotonic()     # 持续对话: 最后交互时刻
                 else:
                     print("[唤醒] 未命中 → 继续待机", flush=True)
                 continue
@@ -472,6 +485,12 @@ class RealVoiceEngine:
                      float(endpoint.get("vad_threshold_dbfs") or background_dbfs),
                      round(len(samples) / 16000, 2),
                      bg_extra)
+            # ---- 在线唤醒·持续对话:静音段不作为轮次(不 MIC_STOP/不空轮),保持唤醒等用户说话;
+            #      任何"判了起始"的段都刷新最后交互时刻(空闲超时判定用) ----
+            if self._wake_enabled:
+                if not endpoint.get("speech_started"):
+                    continue
+                self._awake_at = time.monotonic()
             # ---- 协议适配(ESP32 Julia "听—想—说"):
             # VAD 判定本轮输入结束 → 立即回发独立的 MIC_STOP 文本帧(不能省略),
             # 设备收到后结束上传、UI 进入 THINKING;然后服务器才做 ASR/LLM/TTS。
@@ -530,11 +549,10 @@ class RealVoiceEngine:
                     self._push_pcm(silence[off:off + 1200])
                 self._push_text("SPKE")
                 print("[下行] SPKE(空播报结束)", flush=True)
-                if not self._wake_enabled and self.r.get("mic_restart_after_answer", False):
+                # 在线唤醒·持续对话:空轮后同样续听(不回待机);非唤醒模式按 mic_restart 决定
+                if self._wake_enabled or self.r.get("mic_restart_after_answer", False):
                     self._push_text("MIC_START")
                     print("[下行] MIC_START(空轮后继续下一轮)", flush=True)
-                if self._wake_enabled:
-                    self._awake = False      # 线上唤醒: 每轮结束回待机,等下一次唤醒词
                 if self._turn_first_frame_at is not None:
                     print(f"[链路] 第{turn}问(空轮): 首帧→收尾 "
                           f"{time.monotonic() - self._turn_first_frame_at:.2f}s", flush=True)
@@ -575,8 +593,6 @@ class RealVoiceEngine:
                           flush=True)
             self._turn_first_frame_at = None
             self.stream.reset_input_buffer()   # 丢弃回合间残留的补静音帧
-            if self._wake_enabled:
-                self._awake = False            # 线上唤醒: 一轮问答结束回待机(等下一次唤醒词)
 
         if tts_process:
             try:
@@ -836,9 +852,9 @@ class RealVoiceEngine:
             print("[下行] 全部段落播完 · SPKE", flush=True)
         # 连续对话模式(协议多轮要求):SPKE 后重发 MIC_START,设备重新进入 LISTENING
         # 继续下一轮;关闭时设备回 IDLE 等本地唤醒。
-        # 线上唤醒模式(wake.enabled): SPKE 后不发 MIC_START —— 设备回 IDLE 持续上传,
-        # 由引擎回到待机态,等下一次唤醒词判定。
-        if (not self._wake_enabled and self.r.get("mic_restart_after_answer", False)):
+        # 在线唤醒·持续对话(wake.enabled): 同样在 SPKE 后发 MIC_START 续听 —— 唤醒一次后
+        # 不再要求重新说唤醒词,直到空闲超时由引擎回待机。
+        if self._wake_enabled or self.r.get("mic_restart_after_answer", False):
             self._push_text("MIC_START")
             print("[下行] MIC_START(连续对话模式,设备→LISTENING)", flush=True)
 
