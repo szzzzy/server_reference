@@ -117,6 +117,7 @@ class NoiseFloorTracker:
             "gate_db": float(cfg.get("gate_db", 12.0)),
             "rise_trigger_db": float(cfg.get("rise_trigger_db", 1.0)),
             "rise_confirm_updates": int(cfg.get("rise_confirm_updates", 2)),
+            "snap_trigger_db": float(cfg.get("snap_trigger_db", 6.0)),
             "fast_min_frames": int(cfg.get("fast_min_frames", 20)),
             "slow_min_frames": int(cfg.get("slow_min_frames", 50)),
             "floor_min_dbfs": float(cfg.get("floor_min_dbfs", -80.0)),
@@ -187,11 +188,18 @@ class NoiseFloorTracker:
                 self._bg = min(max(self._bg + step, c["floor_min_dbfs"]), c["floor_max_dbfs"])
                 reason = "rise"
         elif p_slow is not None and p_slow < self._bg:
-            # 下降:慢速回落(下降信号可能来自语音间隙/换气,限速保护)
+            # 下降:慢速回落(下降信号可能来自语音间隙/换气,限速保护);
+            # snap 静音快速回落:分位显著低于 bg_t(关风机/人员散去等大落差)时直接重锚 ——
+            # 0.5dB/s 慢速在"噪声刚停 1~2s 即说轻声"的场景会漏检(数十秒追不上);
+            # 仅在预语音段运行(语音期冻结),且以 8s 分位为锚,不会因语音间隙误触
             self._rise_pending = 0
-            step = min(self._bg - p_slow, c["down_max_db_per_s"] * c["update_interval_s"])
-            self._bg = min(max(self._bg - step, c["floor_min_dbfs"]), c["floor_max_dbfs"])
-            reason = "fall"
+            if c["snap_trigger_db"] > 0 and p_slow < self._bg - c["snap_trigger_db"]:
+                self._bg = max(p_slow, c["floor_min_dbfs"])
+                reason = "snap"
+            else:
+                step = min(self._bg - p_slow, c["down_max_db_per_s"] * c["update_interval_s"])
+                self._bg = min(max(self._bg - step, c["floor_min_dbfs"]), c["floor_max_dbfs"])
+                reason = "fall"
         else:
             self._rise_pending = 0
         self._traj.append({

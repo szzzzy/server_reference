@@ -185,9 +185,33 @@ _, _, ep_d = run_vad(turn3_audio, -55.0, NoiseFloorTracker(-36.0, {}))
 print(f"  [fixed ] start={seconds_of(ep_f,'speech_start_seconds')}s endpoint={ep_f['endpoint_triggered']}")
 print(f"  [dynamic] start={seconds_of(ep_d,'speech_start_seconds')}s endpoint={ep_d['endpoint_triggered']} "
       f"bg_final={ep_d['bg_final_dbfs']:.1f}")
-print("  → 实测:回落生效(bg -36→-39),轻声被捕获(滞后 fixed 约0.16s,起始几帧阈值偏高)")
-print("  → 残余 P3 项:噪声刚停 1~2s 内即说轻声,阈值仍偏高可能漏检 —— 据真机/更长 A/B")
-print("    在 P3 调整 down_max_db_per_s 或增加『静音期快速回落』规则,本阶段不视为缺陷")
+print(f"  → 实测:bg_t {ep_d['bg_initial_dbfs']}→{ep_d['bg_final_dbfs']:.1f}dB(快速回落),"
+      f"轻声捕获较 fixed 差距 {abs((seconds_of(ep_d,'speech_start_seconds') or 0) - (seconds_of(ep_f,'speech_start_seconds') or 0)):.2f}s")
+print("  → 下一场景 S4 专门验证『噪声刚停即轻声』的快速回落规则(P3)")
+
+# ================= 场景 S4:恒噪刚停即轻声 → P3 调参验证(snap 快速回落) =================
+print("=" * 72)
+print("S4 快速回落场景:heal 后 bg≈-36 → 风扇-36dB(1s) → 安静2s(预语音段) → 轻声-34.5dB")
+turn4_audio = np.concatenate([
+    noisy(-36.0, 1.0, seed=21),                      # 0~1s 风扇(继续)
+    tone(-58.0, 2.0, f=180.0),                       # 1~3s 安静(预语音段:快落窗口)
+    speech_slice(-34.5, 2.5, 1.5),                   # 3~5.5s 轻声(噪声刚停即说)
+    tone(-58.0, MAX_SECONDS - 5.5, f=180.0),
+])
+write_wav(ROOT / "tools" / "ab_quick.wav", turn4_audio)
+_, _, ep_old = run_vad(turn4_audio, -55.0, NoiseFloorTracker(-36.0, {"down_max_db_per_s": 0.5, "snap_trigger_db": 0.0}))
+_, _, ep_new = run_vad(turn4_audio, -55.0, NoiseFloorTracker(-36.0, {"down_max_db_per_s": 0.5, "snap_trigger_db": 6.0}))
+print(f"  [无snap  ] start={seconds_of(ep_old,'speech_start_seconds')}s endpoint={ep_old['endpoint_triggered']} "
+      f"bg={ep_old['bg_initial_dbfs']}→{ep_old['bg_final_dbfs']:.1f}")
+print(f"  [snap=6dB] start={seconds_of(ep_new,'speech_start_seconds')}s endpoint={ep_new['endpoint_triggered']} "
+      f"bg={ep_new['bg_initial_dbfs']}→{ep_new['bg_final_dbfs']:.1f}")
+old_start = seconds_of(ep_old, "speech_start_seconds")
+new_start = seconds_of(ep_new, "speech_start_seconds")
+check("S4-1 快速回落:bg_t 重锚到安静分位(< -45)", float(ep_new["bg_final_dbfs"]) < -45.0,
+      f"bg={ep_new['bg_final_dbfs']:.1f} (无snap对照={ep_old['bg_final_dbfs']:.1f})")
+check("S4-2 快速回落:噪声刚停即轻声可捕获(起始≤3.4s)",
+      new_start is not None and new_start <= 3.4, f"start={new_start}s (无snap对照={old_start}s)")
+check("S4-3 快速回落:端点正常", bool(ep_new["endpoint_triggered"]))
 
 print("=" * 72)
 print("RESULT:", "ALL PASS" if all(PASS) else "SOME FAILED", f"({sum(PASS)}/{len(PASS)})")

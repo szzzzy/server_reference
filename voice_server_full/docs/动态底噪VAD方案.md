@@ -1,6 +1,6 @@
 # 动态底噪 VAD 改造方案（执行稿）
 
-> 状态：**执行稿，P1、P2 已实施**（`NoiseFloorTracker` 双窗估计器 + 会话级接入 + 诊断字段 + 引擎级 heal + A/B 工具 `tools/vad_ab.py`，默认关闭可回归，见 §9/§12）；P3（参数调整）起尚未开始。
+> 状态：**执行稿，P1~P3 已实施**（双窗估计器 + 会话级接入 + 诊断 + 引擎级 heal + snap 快速回落 + A/B 工具 `tools/vad_ab.py`，默认关闭可回归，见 §9/§12）；P4（默认开启+定稿）前待真机全链路 A/B。
 > 范围：`voice_server_full/` 中服务器侧 VAD。
 > 本稿整合：双时间尺度估计器、会话级状态、快速窗无门控修正、滞回方向修正、协议边界（MIC_START/MIC_STOP）确认。
 
@@ -144,11 +144,16 @@ p_slow < bg_t
 down_max_db_per_s = 0.5
 ```
 
+**静音快速回落（snap，P3 新增）**：0.5 dB/s 在"噪声刚停 1~2 s 即说轻声"时追不上（数十秒），
+因此当分位显著低于当前估计（`p_slow < bg_t - snap_trigger_db`，默认 6 dB）时直接重锚
+`bg_t = p_slow`。适用前提：仅预语音段运行（语音期冻结）、以 8 s 分位为锚（不被语音间隙
+误导）——等价于把"分位差距过大"视为一次安静期重校准。
+
 最终效果：
 
 ```text
 环境变吵 → 快速跟随
-环境变静 → 缓慢回落
+环境变静 → 缓慢回落;落差大 → 直接重锚
 ```
 
 ---
@@ -298,6 +303,7 @@ floor_max_dbfs = -35
 
   "rise_trigger_db": 1.0,
   "rise_confirm_updates": 2,
+  "snap_trigger_db": 6.0,
 
   "fast_min_frames": 20,
   "slow_min_frames": 50,
@@ -501,7 +507,7 @@ dynamic floor
   人声处起始（2.18s）/固定底噪仍每轮都坏；回落场景确认 bg_t -36→-39 生效、轻声捕获仅滞后
   0.16s。关键结论见 §14。
 
-### P3 参数调整
+### P3 参数调整（已完成，本稿落库时）
 
 根据 A/B 调整：
 
@@ -512,6 +518,14 @@ up_max_db_per_s
 down_max_db_per_s
 rise_trigger_db
 ```
+
+* **P3 完成结论**：保留默认 `fast_window_s=1.5 / gate_db=12 / up_max_db_per_s=3 /
+  down_max_db_per_s=0.5 / rise_trigger_db=1`；依据 S3 残缺点新增 **`snap_trigger_db=6`**
+  （静音快速回落，见 §3.2）。`tools/vad_ab.py` 扩到 S4 场景，9/9 通过：
+  - S4 实测：无 snap 时 bg_t -36→-37.5、起始 3.30s；有 snap 时 bg_t -36→**-58.2**（重锚到安静
+    分位）、起始 **3.14s** —— 噪声刚停即轻声的场景由 snap 兜底；
+  - S3 实测：6s 安静期 bg_t -36→-58.2 快速回落，轻声捕获与固定底噪同速（0.00s 差）；
+  - P1 回归 14/14 通过（snap 未破坏上升/冻结/回落语义）。
 
 ### P4 阈值解耦
 
