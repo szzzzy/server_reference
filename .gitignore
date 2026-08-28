@@ -23,6 +23,9 @@ network/server/releases/manifest.json
 network/certs/ca/
 network/certs/server/
 network/certs/clients/
+network/certs/delivery_*/
+network/certs/_backup_*/
+network/certs/*.zip
 *.key
 *.pem
 
