@@ -28,6 +28,29 @@ from ring_buffer import RingBuffer
 log = logging.getLogger("vs.real")
 
 
+def _normalize_wake(text):
+    """唤醒词匹配归一化(与串口版 V5 一致):小写、去空白与中英文标点。"""
+    return "".join(ch for ch in str(text).lower().strip()
+                   if ch not in " ，。！？,.!?；;：:、\t\r\n")
+
+
+# 唤醒词同音容错:唤醒词走"普通语音识别"(Paraformer),实测把"你好小科"识别成"你好小柯",
+# 因此匹配时给每个字生成"替换一个同音字"的候选(仅录常见的同音误识,不做开放拼音匹配)。
+_WAKE_HOMOPHONES = {
+    "你": "尼泥", "好": "昊号", "小": "晓筱", "科": "柯棵颗课嗑",
+    "智": "芝之", "导": "岛到道", "游": "尤由邮",
+}
+
+
+def _wake_variants(word):
+    """由主词生成同音候选集:原文 + 每个字替换一个同音字(一次一处)。"""
+    out = {word}
+    for i, ch in enumerate(word):
+        for alt in _WAKE_HOMOPHONES.get(ch, ""):
+            out.add(word[:i] + alt + word[i + 1:])
+    return out
+
+
 class StreamingAsr:
     """流式 ASR 协调器("边说边识",延迟优化项)。
 
@@ -268,7 +291,7 @@ class RealVoiceEngine:
             NoiseFloorTracker, capture_seconds, capture_until_endpoint, recognize,
             rms_dbfs, save_wav,
         )
-        from realtime_pipeline import resolve, start_tts_worker
+        from realtime_pipeline import resolve, start_tts_worker, tts_request
 
         models = self.real_cfg.get("models", {})
         tts_base = self._load_base_tts_config()
@@ -326,6 +349,28 @@ class RealVoiceEngine:
                      float(df_cfg.get("rise_trigger_db", 1.0)))
         else:
             self._floor = None
+        # ---- 线上唤醒(2026-08-28 新版语音链路):设备端已去除本地 WakeNet,固件 WSS 认证后
+        #      持续上传 PCM1;服务器待机态用普通 ASR 判定唤醒词(N 个字/一段),命中才进一轮问答。
+        #      参考串口版 V5 两级唤醒的第二级(硬件触发后的 ASR 判定)。默认打开
+        #      (词表仅"你好小科";旧固件本地唤醒模式请设 enabled=false)。 ----
+        wk_cfg = self.real_cfg.get("wake")
+        wk_cfg = wk_cfg if isinstance(wk_cfg, dict) else {}
+        self._wake_enabled = bool(wk_cfg.get("enabled", False))
+        self._wake_words = [str(w).strip() for w in (wk_cfg.get("words") or ["你好小科"])
+                            if str(w).strip()]
+        # 展开同音候选(一次一处替换),匹配时任一命中即唤醒
+        self._wake_needles = set()
+        for _w in self._wake_words:
+            self._wake_needles |= _wake_variants(_normalize_wake(_w))
+        self._wake_prompt = str(wk_cfg.get("prompt", "我在，请讲。") or "")
+        # 待机判定参数(串口版 V5 唤醒段同款:起声快、端点短、段上限小)
+        wk_listen_s = float(wk_cfg.get("listen_seconds", 8.0))
+        wk_endpoint_ms = float(wk_cfg.get("endpoint_silence_ms", 500))
+        wk_start_ms = int(wk_cfg.get("start_active_ms", 20))
+        wk_window_ms = int(wk_cfg.get("start_window_ms", 500))
+        self._awake = False
+        if self._wake_enabled:
+            log.info("线上唤醒: 启用 (词=%s 应答=%r)", self._wake_words, self._wake_prompt)
         # 语音流停止后,在端点静音窗口内自动补静音帧,让现有 VAD 端点逻辑生效
         self.stream.enable_auto_silence(endpoint_ms / 1000.0 + 0.4)
 
@@ -338,10 +383,66 @@ class RealVoiceEngine:
             self._short_sleep(0.2)
             if self.stream.real_bytes_total <= self._real_bytes_consumed:
                 continue
-            if not self._calibration_done:
+            if not self._calibration_done and self._floor is None:
                 self._calibrate_background(self.stream, background_seconds)
+            elif not self._calibration_done:
+                # 动态底噪启用:跳过开机静态校准 —— 校准窗口会"消费"持续上传流的开头音频
+                # (实测唤醒词前半段被吃掉 → 只剩"小科"),且 3 次重试造成启动后 ~24s 哑巴期;
+                # bg_t 由估计器在每轮预语音段自学(初值 = 配置默认)。
+                self._calibration_done = True
+                log.info("动态底噪已启用: 跳过开机静态校准(bg 由估计器自学, 初值 %.1fdB)",
+                         default_background)
             background_dbfs = (self._background_dbfs if self._background_dbfs is not None
                                else default_background)
+            # ---- 线上唤醒:待机态(未唤醒)只做唤醒词判定,不进入问答编排 ----
+            # 固件持续上传 → 每(≤8s)一段,VAD 判定;仅对"判了起始"的段做普通 ASR;
+            # 命中"你好小科" → 播唤醒应答 → 丢弃应答期间上行(含扬声器回声,无AEC) →
+            # MIC_START(设备→LISTEN) → 进入唤醒态;未命中继续守听(不发任何下行命令)。
+            if self._wake_enabled and not self._awake:
+                try:
+                    w_samples, _, w_ep = capture_until_endpoint(
+                        self.stream, max_seconds=wk_listen_s,
+                        background_dbfs=background_dbfs,
+                        endpoint_silence_ms=wk_endpoint_ms,
+                        threshold_above_bg=start_above,
+                        endpoint_threshold_above_bg=end_above,
+                        endpoint_active_penalty=active_penalty,
+                        voice_start_ms=wk_start_ms,
+                        voice_start_window_ms=wk_window_ms,
+                        floor_tracker=self._floor,
+                    )
+                except TimeoutError:
+                    self._real_bytes_consumed = self.stream.real_bytes_total
+                    continue
+                self._real_bytes_consumed = self.stream.real_bytes_total
+                if not w_ep.get("speech_started") or len(w_samples) < 1600:
+                    continue                      # 环境静音/极短段:不识别,继续守听
+                # 只识别"起始回退后→段尾"的有效语音段 —— 整段喂 ASR 时,开头长静音会被
+                # 流式切块吞掉前缀字(实测"你好小科"只识别出"小科");与串口版
+                # "保留触发首帧/pre-roll 作为唤醒段一部分"的做法等价。
+                w_si = int(float(w_ep.get("speech_start_seconds") or 0.0) * 16000)
+                w_seg = w_samples[w_si:] if 0 < w_si < len(w_samples) else w_samples
+                wake_text, _, wk_asr_s = recognize(asr, w_seg)
+                wake_text = (wake_text or "").strip()
+                value = _normalize_wake(wake_text)
+                self._remember(f"WAKE? {wake_text or '[空]'}")
+                print(f"[唤醒] 候选识别({wk_asr_s:.2f}s): {wake_text!r}", flush=True)
+                if any(n in value for n in self._wake_needles):
+                    print(f"[唤醒] 命中唤醒词 → 应答: {self._wake_prompt!r}", flush=True)
+                    self._remember(f"WAKE+ {wake_text}")
+                    if self._wake_prompt:
+                        self._speak_prompt(self._wake_prompt, tts_base, queue, tts_dir,
+                                           tag=f"wake_{int(time.time())}")
+                    # 应答播放期间设备仍在上传(含扬声器回声)——无 AEC,丢弃这段上行,
+                    # 否则 MIC_START 后的第一句会把"我 在,请讲"的残影当问题听
+                    self.stream.reset_input_buffer()
+                    self._real_bytes_consumed = self.stream.real_bytes_total
+                    self._push_text("MIC_START")
+                    print("[下行] MIC_START(线上唤醒→LISTEN)", flush=True)
+                    self._awake = True
+                else:
+                    print("[唤醒] 未命中 → 继续待机", flush=True)
+                continue
             # 流式 ASR:每轮全新上下文(与 recognize 语义一致),VAD 收集期间边收边识别
             asr_stream = StreamingAsr(asr)
             try:
@@ -429,9 +530,11 @@ class RealVoiceEngine:
                     self._push_pcm(silence[off:off + 1200])
                 self._push_text("SPKE")
                 print("[下行] SPKE(空播报结束)", flush=True)
-                if self.r.get("mic_restart_after_answer", False):
+                if not self._wake_enabled and self.r.get("mic_restart_after_answer", False):
                     self._push_text("MIC_START")
                     print("[下行] MIC_START(空轮后继续下一轮)", flush=True)
+                if self._wake_enabled:
+                    self._awake = False      # 线上唤醒: 每轮结束回待机,等下一次唤醒词
                 if self._turn_first_frame_at is not None:
                     print(f"[链路] 第{turn}问(空轮): 首帧→收尾 "
                           f"{time.monotonic() - self._turn_first_frame_at:.2f}s", flush=True)
@@ -472,6 +575,8 @@ class RealVoiceEngine:
                           flush=True)
             self._turn_first_frame_at = None
             self.stream.reset_input_buffer()   # 丢弃回合间残留的补静音帧
+            if self._wake_enabled:
+                self._awake = False            # 线上唤醒: 一轮问答结束回待机(等下一次唤醒词)
 
         if tts_process:
             try:
@@ -731,7 +836,9 @@ class RealVoiceEngine:
             print("[下行] 全部段落播完 · SPKE", flush=True)
         # 连续对话模式(协议多轮要求):SPKE 后重发 MIC_START,设备重新进入 LISTENING
         # 继续下一轮;关闭时设备回 IDLE 等本地唤醒。
-        if self.r.get("mic_restart_after_answer", False):
+        # 线上唤醒模式(wake.enabled): SPKE 后不发 MIC_START —— 设备回 IDLE 持续上传,
+        # 由引擎回到待机态,等下一次唤醒词判定。
+        if (not self._wake_enabled and self.r.get("mic_restart_after_answer", False)):
             self._push_text("MIC_START")
             print("[下行] MIC_START(连续对话模式,设备→LISTENING)", flush=True)
 
@@ -754,6 +861,31 @@ class RealVoiceEngine:
         }
         self._append_row(result_csv, row)
         return row
+
+    def _speak_prompt(self, text, tts_base, queue, tts_dir, tag):
+        """单段 TTS 播报(唤醒应答/提示语):非流式合成完整 wav → SPKS + PCM ≤1200B/帧 + SPKE。
+
+        与 _answer_qa 的流式切段不同——应答是单句,直接 tts_request 拿到完整 wav 再下发,
+        简单且不会与其他播放交错;播放期间设备仍在上传(含回声),调用方负责丢弃该段上行。
+        """
+        request_id = f"prompt_{tag}"
+        wav = tts_dir / f"{request_id}.wav"
+        from realtime_pipeline import tts_request
+        tts_request(queue, request_id, text, wav)
+        import wave
+        with wave.open(str(wav), "rb") as w:
+            pcm = w.readframes(w.getnframes())
+            rate = w.getframerate()
+        if not pcm:
+            raise RuntimeError("唤醒应答 TTS 产物为空")
+        self._push_text(f"SPKS {rate}")
+        self._board_spks_active = True
+        for off in range(0, len(pcm), 1200):
+            self._push_pcm(pcm[off:off + 1200])
+            time.sleep(0.02)
+        self._push_text("SPKE")
+        self._board_spks_active = False
+        print(f"[下行] 唤醒应答播报完成: {text[:24]} ({len(pcm) / 2 / rate:.1f}s)", flush=True)
 
     def _stream_tts_segment(self, queue, request_id, stream_dir, start_board=True,
                             end_board=True):

@@ -222,5 +222,8 @@ mic_started | mic_stopped | mic_wake | mic_sleep | volume_set
 1. **WSS 建连**：验证 Bearer 鉴权 → PING→PONG；
 2. **语音上行**：发 `MIC_START` → 设备回 `mic_started` → 收 PCM1 帧流（校验魔数/seq/sum8）→ `MIC_STOP` → `mic_stopped`；
 3. **语音下行**：`SPKS 24000` + PCM 帧 → 设备出声；`SPKV`/`SPKE` 生效；
-4. **本地唤醒**（设备自触发）：喊"你好小智" → 设备日志 Wake word detected → 设备自动发 MIC_START 效果（PCM1 开始）——服务器无需主动发 MIC_START 也能收到流；
+4. **线上唤醒**（新版固件：无本地唤醒词）：设备 WSS 认证后**持续上传 PCM1** → 服务器待机态
+   用普通 ASR 判定"你好小科"（含同音容错）→ 下发 MIC_START（设备→LISTEN，UI 闭眼）；
+   服务器 VAD 判说完 → MIC_STOP（结束本轮 LISTEN，不关 PCM）→ ASR/LLM/TTS 下行
+   （SPKS→PCM→SPKE，设备播完回 IDLE，PCM 继续上传）→ 服务器回待机，第二轮需重新说唤醒词。
 5. **OTA**：`ota_check`→`ota_check_response`→`ota_status` 序列 + HTTPS 下载（Range/ETag）。

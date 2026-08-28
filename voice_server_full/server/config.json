@@ -82,6 +82,15 @@
       "system_prompt": "",
       "history_turns": 0,
       "max_new_tokens": 80,
+      "wake": {
+        "enabled": true,
+        "words": ["你好小科"],
+        "prompt": "我在，请讲。",
+        "listen_seconds": 8.0,
+        "endpoint_silence_ms": 500,
+        "start_active_ms": 20,
+        "start_window_ms": 500
+      },
       "vad": {
         "background_dbfs": -60,
         "background_seconds": 2.5,
