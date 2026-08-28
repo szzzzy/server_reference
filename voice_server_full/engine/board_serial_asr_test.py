@@ -381,6 +381,9 @@ def capture_until_endpoint(
     speech_start_sample = None
     last_active_sample = None
     start = time.perf_counter()
+    # 动态底噪音频时钟:帧数驱动(epoch + 样本数/sr),实时链路等价(帧按 50fps 到达),
+    # 回放/回归确定性;跨轮单调(epoch 取真实时钟),保持"超时清零确认计数"的语义
+    floor_epoch = time.monotonic()
 
     while total_samples < max_samples:
         _, board_dbfs, frame = read_frame(ser)
@@ -396,7 +399,8 @@ def capture_until_endpoint(
         # 按最新 bg_t 重算本帧阈值(两次加法,零额外成本);floor_tracker=None 时
         # bg_t 恒为 background_dbfs,与旧版行为完全一致。
         if floor_tracker is not None:
-            floor_tracker.on_frame(frame_dbfs, speech_started)
+            floor_tracker.on_frame(frame_dbfs, speech_started,
+                                   ts=floor_epoch + total_samples / sr)
             bg_now = floor_tracker.bg()
             start_threshold_dbfs = bg_now + threshold_above_bg
             endpoint_threshold_dbfs = bg_now + endpoint_threshold_above_bg

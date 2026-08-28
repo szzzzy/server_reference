@@ -392,6 +392,29 @@ class RealVoiceEngine:
                 recognized, first_partial, asr_seconds = "", "", 0.0
                 print(f"[识别] 第{turn}问: 音频<0.1s,无有效语音", flush=True)
             self._remember(f"Q{turn}: {recognized or '[空]'}")
+            # ---- 动态底噪 heal(P2):噪声型轮次 → 重锚 bg_t,防止突变噪声"每轮都坏" ----
+            # 依据:开了动态底噪 + 本轮"判了起始但从未触发端点"(被持续高电平钉死)+
+            # 空识别或活跃占比≈100% → 判定为噪声轮:
+            #   ① 用本轮音频帧电平 10% 分位重锚 bg_t(reset 清空窗口,下轮预语音段重新学习);
+            #   ② 无有效语义 → 走下方既有"空轮收尾"(SPKS→静音→SPKE),不把噪声当问题回答。
+            # 注:帧级自适应无法阻止"高于旧阈值"的噪声在 ~0.12s 内误触发起始(120ms 起始判定
+            #    快于确认+上升的 1.5~2s),因此突变/恒噪场景必须靠本 heal 跨轮恢复。
+            if (self._floor is not None and endpoint.get("speech_started")
+                    and not endpoint.get("endpoint_triggered") and len(samples) >= 16000 * 2):
+                th = float(endpoint.get("vad_threshold_dbfs") or background_dbfs)
+                n = len(samples) // 320
+                rows = np.array(samples[:n * 320], dtype=np.int16).reshape(-1, 320)
+                fr = np.array([rms_dbfs(row) for row in rows])
+                active_ratio = float(np.mean(fr > th))
+                if not recognized or active_ratio >= 0.98:
+                    new_bg = float(np.percentile(fr, 10))
+                    log.warning("动态底噪 heal: 噪声型轮次(无端点 活跃占比=%.0f%% ASR=%s) → bg_t %.1f→%.1fdB",
+                                active_ratio * 100, "空" if not recognized else "有字",
+                                self._floor.bg(), new_bg)
+                    self._floor.reset(new_bg)
+                    if recognized:
+                        recognized = ""
+                        print("[识别] 噪声型轮次: 丢弃文本,走空轮收尾", flush=True)
             if not recognized:
                 # 空识别(或无有效语音):不做任何语义内容,但按协议完成收尾,
                 # 避免设备停在 THINKING —— "空播报":SPKS → 0.12s 静音 PCM → SPKE,
