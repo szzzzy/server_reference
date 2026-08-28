@@ -33,3 +33,19 @@ third_party/CosyVoice/
 
 # 固件构建产物(源码已入库;build 可重新生成)
 julia-fused-base/build/
+
+# virtual_server 是 voice_server_full/server 的目录联接(core.symlinks=false 下 git 会展开重复收录,故忽略)
+virtual_server/
+
+# voice_server_full 运行/发布产物(与 network/ 约定一致)
+voice_server_full/server/runs/
+voice_server_full/server/sim_data/
+voice_server_full/server/releases/files/
+voice_server_full/server/releases/manifest.json
+voice_server_full/certs/ca/
+voice_server_full/certs/server/
+voice_server_full/certs/clients/
+voice_server_full/certs/delivery_*/
+voice_server_full/certs/_backup_*/
+voice_server_full/certs/*.zip
+voice_server_full/samples/

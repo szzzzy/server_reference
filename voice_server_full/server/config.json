@@ -1,0 +1,98 @@
+{
+  "server": {
+    "addr": "auto"
+  },
+  "wss": {
+    "host": "0.0.0.0",
+    "port": 9443,
+    "path": "/voice",
+    "token": "julia-test-token-2026",
+    "tls": true,
+    "ping_interval": 60,
+    "ping_timeout": 30
+  },
+  "file_server": {
+    "host": "0.0.0.0",
+    "port": 8443,
+    "tls": true,
+    "root": "releases/files"
+  },
+  "mqtt": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 1883,
+    "enable_local_broker": true,
+    "enable_tls": false,
+    "tls_port": 8883,
+    "username": "",
+    "password": "",
+    "server_client_id": "virtual-server"
+  },
+  "topics": {
+    "ota_check": "/device/ota/check",
+    "ota_response": "/device/ota/response",
+    "ota_notify": "/device/ota/notify",
+    "ota_status": "/device/ota/status",
+    "audio_check": "/device/audio/check",
+    "audio_response": "/device/audio/response",
+    "audio_status": "/device/audio/status",
+    "vcmd": "voice/esp32s3/vcmd",
+    "vstatus": "voice/esp32s3/vstatus"
+  },
+  "paths": {
+    "server_cert": "../certs/server/server.crt",
+    "server_key": "../certs/server/server.key",
+    "manifest": "releases/manifest.json"
+  },
+  "deps_root": "C:/Users/user/Desktop/vr_test_5090_20260819_224201",
+  "conversation": {
+    "system_prompt": "你是语音助手。请用中文自然、简练地回答用户问题，回答控制在2到3个连贯短句，共约30到50个汉字，第一句尽量不超过10个字，直接回答不要铺垫。用户打招呼时，只回一句简短问候并紧接着询问用户需求，不要只回复\"你好\"。用户语音可能存在同音字误识，请结合语境理解，不要追问或纠正用词。资料不足时简短说明，不要编造。",
+    "max_new_tokens": 60,
+    "history_turns": 10
+  },
+  "voice_control": {
+    "endpoint_silence_ms": 400,
+    "dialog_endpoint_silence_ms": 400,
+    "background_seconds": 2.5,
+    "first_tts_segment_chars": 10,
+    "later_tts_segment_chars": 40,
+    "first_tts_fast_cut_chars": 10
+  },
+  "tts": {
+    "role": "museum_female",
+    "reference_manifest": "tts_roles_5090/results/reference_manifest.json",
+    "fallback_reference_wav": "third_party/CosyVoice/asset/zero_shot_prompt.wav",
+    "fallback_reference_text": "希望你以后能够做的比我还好呦。",
+    "play_audio": false,
+    "output": "board_speaker",
+    "board_volume_percent": 100,
+    "stream_chunk_bytes": 1024
+  },
+  "voice": {
+    "mode": "stub",
+    "downlink_rate": 24000,
+    "mic_restart_after_answer": false,
+    "real": {
+      "deps_root": "C:/Users/user/Desktop/vr_test_5090_20260819_224201",
+      "models": {
+        "asr": "models/paraformer-zh-streaming",
+        "llm": "models/Qwen3-4B-Instruct-2507",
+        "tts": "models/CosyVoice2-0.5B"
+      },
+      "system_prompt": "",
+      "history_turns": 0,
+      "max_new_tokens": 80,
+      "vad": {
+        "background_dbfs": -60,
+        "background_seconds": 2.5,
+        "start_above_db": 3,
+        "end_above_db": 3,
+        "start_active_ms": 120,
+        "start_window_ms": 300,
+        "endpoint_ms": 400,
+        "max_seconds": 15,
+        "active_penalty": 4.0
+      }
+    }
+  }
+}
