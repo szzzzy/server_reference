@@ -161,6 +161,7 @@ class RealVoiceEngine:
         self._calibration_done = False
         self._floor = None                  # 动态底噪估计器(会话级;None=未启用/固定底噪)
         self._board_spks_active = False     # 下行 SPKS 是否已开(跨段连续播)
+        self._playback_until = 0.0          # 半双工: 该时刻前不听/丢弃上行(扬声器回声余震)
         self._first_spks_at = None          # 本轮首块音频下发的时刻(端点→首块计时用)
         self._turn_first_frame_at = None    # 本轮第一帧到达时刻(完整链路计时起点)
         self._history = []                  # 多轮对话历史[{user},{assistant}...],按 history_turns 截取
@@ -389,6 +390,14 @@ class RealVoiceEngine:
 
         while not self._stop.is_set():
             self._short_sleep(0.2)
+            # ---- 半双工(无 AEC):SPKE 后 0.6s 内不听 —— 扬声器回声余震;
+            #      播放期间(SPKS→SPKE)积累的上行也在这里一次性清掉,否则设备会把
+            #      "我刚播的内容"录回去,服务器再识别 → 自问自答。
+            if time.monotonic() < self._playback_until:
+                self.stream.reset_input_buffer()
+                self._real_bytes_consumed = self.stream.real_bytes_total
+                self._short_sleep(0.1)
+                continue
             # ---- 唤醒态空闲超时(唯一退出条件): 持续对话时 60s 无活动段 → 回待机等下次唤醒词。
             #     放在最外层(等字节之前):即使设备停传/无新字节也要计时;不发任何下行命令
             #     (设备侧 LISTEN/IDLE 由固件 5 分钟远场待机自愈,PCM 不受影响)。
@@ -553,6 +562,7 @@ class RealVoiceEngine:
                     self._push_pcm(silence[off:off + 1200])
                 self._push_text("SPKE")
                 print("[下行] SPKE(空播报结束)", flush=True)
+                self._playback_until = time.monotonic() + 0.3   # 半双工: 零声播报后短暂不听
                 # 在线唤醒·持续对话:空轮后同样续听(不回待机);非唤醒模式按 mic_restart 决定
                 if self._wake_enabled or self.r.get("mic_restart_after_answer", False):
                     self._push_text("MIC_START")
@@ -582,6 +592,7 @@ class RealVoiceEngine:
                 if self._board_spks_active:
                     self._push_text("SPKE")
                     self._board_spks_active = False
+                    self._playback_until = time.monotonic() + 0.3   # 半双工
                     print("[下行] SPKE(异常收尾)", flush=True)
             # ---- 完整链路计时(首帧上传 → SPKE 播完)----
             if self._turn_first_frame_at is not None:
@@ -853,6 +864,7 @@ class RealVoiceEngine:
         if self._board_spks_active:
             self._push_text("SPKE")
             self._board_spks_active = False
+            self._playback_until = time.monotonic() + 0.6   # 半双工: 播报回声余震期不听
             print("[下行] 全部段落播完 · SPKE", flush=True)
         # 连续对话模式(协议多轮要求):SPKE 后重发 MIC_START,设备重新进入 LISTENING
         # 继续下一轮;关闭时设备回 IDLE 等本地唤醒。
@@ -905,6 +917,7 @@ class RealVoiceEngine:
             time.sleep(0.02)
         self._push_text("SPKE")
         self._board_spks_active = False
+        self._playback_until = time.monotonic() + 0.6   # 半双工: 应答回声余震期不听
         print(f"[下行] 唤醒应答播报完成: {text[:24]} ({len(pcm) / 2 / rate:.1f}s)", flush=True)
 
     def _stream_tts_segment(self, queue, request_id, stream_dir, start_board=True,
@@ -968,6 +981,7 @@ class RealVoiceEngine:
                 if end_board and self._board_spks_active:
                     self._push_text("SPKE")
                     self._board_spks_active = False
+                    self._playback_until = time.monotonic() + 0.6   # 半双工
                 print(f"[下行] 段完成 · {next_index} 块音频"
                       + (f" · SPKE(段末)" if end_board and not self._board_spks_active else ""),
                       flush=True)
@@ -978,6 +992,7 @@ class RealVoiceEngine:
         if self._board_spks_active:
             self._push_text("SPKE")
             self._board_spks_active = False
+            self._playback_until = time.monotonic() + 0.6   # 半双工
             log.warning("TTS 段超时,已发 SPKE: %s", request_id)
         else:
             log.warning("TTS 段超时: %s", request_id)

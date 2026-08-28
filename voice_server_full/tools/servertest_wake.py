@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
-"""线上唤醒全链路探测(唤醒一次·持续对话版本):
+"""线上唤醒全链路探测(唤醒一次·持续对话 + 半双工回声免疫版本):
     阶段1: [安静 + "你好小科" + 安静] → 期待 SPKS→PCM→SPKE(应答)→MIC_START
-    阶段2: [问题段 + 安静] → 期待 MIC_STOP→SPKS→PCM→SPKE → **MIC_START(续听,无唤醒词)**
+    阶段2: [问题段 + 安静 + **回声段**(模拟扬声器回声)] →
+           期待 MIC_STOP→SPKS→PCM→SPKE → MIC_START(续听,无唤醒词);
+           **且 SPKE 后 10s 内无第二轮 MIC_STOP**(半双工:回声不被识别,无自问自答)
     阶段3: 静默(停传)超过 timeout_seconds(测试时 config 设 8s) → 期待引擎回待机
     阶段4: 再传一次唤醒词 → 期待再次唤醒应答 + MIC_START(证明超时后回了待机)
 
 用法: 先启动 run_server.py --voice-mode real(voice.real.wake.enabled=true),再运行本脚本。
-测试超时前请把 config time.voice.real.wake.timeout_seconds 临时调小(如 8),测完恢复 60。
+测试超时前请把 config voice.real.wake.timeout_seconds 临时调小(如 8),测完恢复 60。
 """
 import asyncio
 import json
@@ -99,8 +101,10 @@ async def main():
         tone(-58.0, 0.8, f=180.0),
     ])
     phase2 = np.concatenate([
-        speech_slice(-25.0, 2.5, 1.5),
-        tone(-58.0, 1.0, f=180.0),
+        speech_slice(-25.0, 2.5, 1.5),                  # 问题段(标准女声 2.5s)
+        tone(-58.0, 0.4, f=180.0),
+        speech_slice(-25.0, 2.5, 4.0),                  # 回声段:模拟扬声器播报被麦克风录回
+        tone(-58.0, 0.6, f=180.0),
     ])
 
     # ---- 阶段1: 唤醒词 → 应答 + MIC_START ----
@@ -123,6 +127,13 @@ async def main():
     check("P2b 持续对话: SPKE 后收到 MIC_START(无需重新说唤醒词)",
           seq2b and seq2b[-1] == "MIC_START",
           f"seq={seq2b}")
+
+    # ---- P5 半双工:回声免疫 —— SPKE 后必须无第二轮 MIC_STOP(否则=自问自答) ----
+    t5, _ = await collect_until(ws, "MIC_STOP", 10.0, "phase5_echo")
+    seq5 = [t for _, t in t5]
+    check("P5 回声免疫: 播报回声不被识别为新一轮问题(无第二轮 MIC_STOP)",
+          "MIC_STOP" not in seq5 and "SPKS 24000" not in seq5,
+          f"seq={seq5}")
 
     # ---- 阶段3: 静默停传 > timeout(8s),引擎应回待机 ----
     timeout_s = float(cfg.get("voice", {}).get("real", {}).get("wake", {}).get("timeout_seconds", 60))
