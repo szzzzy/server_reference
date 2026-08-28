@@ -71,7 +71,7 @@
   "voice": {
     "mode": "stub",
     "downlink_rate": 24000,
-    "mic_restart_after_answer": false,
+    "mic_restart_after_answer": true,
     "real": {
       "deps_root": "C:/Users/user/Desktop/vr_test_5090_20260819_224201",
       "models": {
@@ -93,7 +93,7 @@
         "max_seconds": 15,
         "active_penalty": 4.0,
         "dynamic_floor": {
-          "enabled": false,
+          "enabled": true,
           "fast_window_s": 1.5,
           "slow_window_s": 8.0,
           "percentile": 10,

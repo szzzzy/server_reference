@@ -392,13 +392,13 @@ class RealVoiceEngine:
                 recognized, first_partial, asr_seconds = "", "", 0.0
                 print(f"[识别] 第{turn}问: 音频<0.1s,无有效语音", flush=True)
             self._remember(f"Q{turn}: {recognized or '[空]'}")
-            # ---- 动态底噪 heal(P2):噪声型轮次 → 重锚 bg_t,防止突变噪声"每轮都坏" ----
-            # 依据:开了动态底噪 + 本轮"判了起始但从未触发端点"(被持续高电平钉死)+
-            # 空识别或活跃占比≈100% → 判定为噪声轮:
-            #   ① 用本轮音频帧电平 10% 分位重锚 bg_t(reset 清空窗口,下轮预语音段重新学习);
-            #   ② 无有效语义 → 走下方既有"空轮收尾"(SPKS→静音→SPKE),不把噪声当问题回答。
-            # 注:帧级自适应无法阻止"高于旧阈值"的噪声在 ~0.12s 内误触发起始(120ms 起始判定
-            #    快于确认+上升的 1.5~2s),因此突变/恒噪场景必须靠本 heal 跨轮恢复。
+            # ---- 动态底噪 heal(P2):无端点轮 → 重锚 bg_t,防止突变噪声"每轮都坏" ----
+            # 依据:开了动态底噪 + 本轮"判了起始但从未触发端点"(被持续高电平钉死)→
+            # 说明底噪估计失效(无论本轮是否混有可识别人声):
+            #   ① 一律用本轮音频帧电平 10% 分位重锚 bg_t(reset 清空窗口,下轮预语音段重新学习);
+            #   ② 仅当确认为"纯噪声轮"(空识别 或 活跃占比≈100%)时才丢弃文本走空轮收尾;
+            #      若 ASR 已识别出有效人声(噪声+人声混合轮),仍正常作答 —— 教训:实测量
+            #      活跃占比 0.977 < 0.98 门槛,若把重锚绑在"丢弃文本"上会漏掉修复。
             if (self._floor is not None and endpoint.get("speech_started")
                     and not endpoint.get("endpoint_triggered") and len(samples) >= 16000 * 2):
                 th = float(endpoint.get("vad_threshold_dbfs") or background_dbfs)
@@ -406,12 +406,15 @@ class RealVoiceEngine:
                 rows = np.array(samples[:n * 320], dtype=np.int16).reshape(-1, 320)
                 fr = np.array([rms_dbfs(row) for row in rows])
                 active_ratio = float(np.mean(fr > th))
+                new_bg = float(np.percentile(fr, 10))
+                # 钳制到估计器语义范围(防残余帧/异常帧把锚点拉到 -120 级病态值)
+                new_bg = min(max(new_bg, float(self._floor.cfg.get("floor_min_dbfs", -80.0))),
+                             float(self._floor.cfg.get("floor_max_dbfs", -35.0)))
+                log.warning("动态底噪 heal: 无端点轮(活跃占比=%.0f%% ASR=%s) → bg_t %.1f→%.1fdB",
+                            active_ratio * 100, "空" if not recognized else "有字",
+                            self._floor.bg(), new_bg)
+                self._floor.reset(new_bg)
                 if not recognized or active_ratio >= 0.98:
-                    new_bg = float(np.percentile(fr, 10))
-                    log.warning("动态底噪 heal: 噪声型轮次(无端点 活跃占比=%.0f%% ASR=%s) → bg_t %.1f→%.1fdB",
-                                active_ratio * 100, "空" if not recognized else "有字",
-                                self._floor.bg(), new_bg)
-                    self._floor.reset(new_bg)
                     if recognized:
                         recognized = ""
                         print("[识别] 噪声型轮次: 丢弃文本,走空轮收尾", flush=True)

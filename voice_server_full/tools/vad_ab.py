@@ -170,6 +170,8 @@ check("S2-5 动态底噪第二轮只在人声处起始(≥1.5s, heal 生效)",
       f"start={seconds_of(eps['turn2_dynamic'],'speech_start_seconds')}s")
 check("S2-6 动态底噪第二轮端点正常触发(噪声不再钉死)",
       bool(eps["turn2_dynamic"]["endpoint_triggered"]))
+write_wav(ROOT / "tools" / "ab_turn2.wav", turn2_audio)   # 供真机全链路 A/B 第二轮
+write_wav(ROOT / "tools" / "ab_noise.wav", noisy(-35.0, MAX_SECONDS, seed=23))  # 纯噪声轮(heal 场景)
 
 # ================= 场景 S3:回落过慢 → P3 调参项(仅打印) =================
 print("=" * 72)
