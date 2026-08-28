@@ -89,14 +89,16 @@
         "timeout_seconds": 60,
         "listen_seconds": 8.0,
         "endpoint_silence_ms": 500,
+        "start_above_db": 3.0,
+        "end_above_db": 3.0,
         "start_active_ms": 20,
         "start_window_ms": 500
       },
       "vad": {
         "background_dbfs": -60,
         "background_seconds": 2.5,
-        "start_above_db": 3,
-        "end_above_db": 3,
+        "start_above_db": 5.0,
+        "end_above_db": 3.0,
         "start_active_ms": 120,
         "start_window_ms": 300,
         "endpoint_ms": 400,

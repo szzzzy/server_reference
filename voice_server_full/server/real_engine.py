@@ -365,11 +365,15 @@ class RealVoiceEngine:
         self._wake_prompt = str(wk_cfg.get("prompt", "我在，请讲。") or "")
         # 唤醒一次·持续对话: 唤醒后不回待机,仅空闲超时(无"判了起始"的段)才回待机
         wk_timeout_s = float(wk_cfg.get("timeout_seconds", 60.0) or 0.0)
-        # 待机判定参数(串口版 V5 唤醒段同款:起声快、端点短、段上限小)
+        # 待机判定参数(唤醒词判定要"灵敏":起声 20ms/窗口 500ms、门限默认 3dB ——
+        # 唤醒只探测"有人说话",宁可多判候选 ASR 也不能漏掉唤醒词;
+        # 唤醒后的对话态由 voice.real.vad 控制(默认 5dB/120ms,严格) —— 见 config)
         wk_listen_s = float(wk_cfg.get("listen_seconds", 8.0))
         wk_endpoint_ms = float(wk_cfg.get("endpoint_silence_ms", 500))
         wk_start_ms = int(wk_cfg.get("start_active_ms", 20))
         wk_window_ms = int(wk_cfg.get("start_window_ms", 500))
+        wk_start_above = float(wk_cfg.get("start_above_db", 3.0))
+        wk_end_above = float(wk_cfg.get("end_above_db", 3.0))
         self._awake = False
         self._awake_at = 0.0
         if self._wake_enabled:
@@ -416,8 +420,8 @@ class RealVoiceEngine:
                         self.stream, max_seconds=wk_listen_s,
                         background_dbfs=background_dbfs,
                         endpoint_silence_ms=wk_endpoint_ms,
-                        threshold_above_bg=start_above,
-                        endpoint_threshold_above_bg=end_above,
+                        threshold_above_bg=wk_start_above,
+                        endpoint_threshold_above_bg=wk_end_above,
                         endpoint_active_penalty=active_penalty,
                         voice_start_ms=wk_start_ms,
                         voice_start_window_ms=wk_window_ms,
