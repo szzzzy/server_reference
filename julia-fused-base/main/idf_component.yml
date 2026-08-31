@@ -1,6 +1,0 @@
-dependencies:
-  # protocol_examples_common：ESP-IDF 示例公共组件（本地路径，不联网）。
-  protocol_examples_common:
-    path: ${IDF_PATH}/examples/common_components/protocol_examples_common
-  # mqtt 与 cJSON：使用 ESP-IDF 内置组件（components/mqtt、components/json），
-  # 由 CMake 自动发现，不从组件仓库下载（避免构建时联网）。

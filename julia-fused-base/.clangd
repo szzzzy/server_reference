@@ -1,6 +1,0 @@
-# Julia Fused-Base Clangd 配置
-# 基于项目的 compile_commands.json（由 CMake 生成）做 IntelliSense。
-# 移除编译参数中的 -f* / -m*（Clang 与 GCC 配置参数不兼容，保留会误报）。
-
-CompileFlags:
-    Remove: [-f*, -m*]
