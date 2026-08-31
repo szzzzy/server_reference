@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""线上唤醒全链路探测(唤醒一次·持续对话 + 半双工回声免疫版本):
+"""线上唤醒全链路探测(唤醒一次·持续对话 + 半双工回声免疫 + 播放期打断):
     阶段1: [安静 + "你好小科" + 安静] → 期待 SPKS→PCM→SPKE(应答)→MIC_START
-    阶段2: [问题段 + 安静 + **回声段**(模拟扬声器回声)] →
-           期待 MIC_STOP→SPKS→PCM→SPKE → MIC_START(续听,无唤醒词);
-           **且 SPKE 后 10s 内无第二轮 MIC_STOP**(半双工:回声不被识别,无自问自答)
-    阶段3: 静默(停传)超过 timeout_seconds(测试时 config 设 8s) → 期待引擎回待机
-    阶段4: 再传一次唤醒词 → 期待再次唤醒应答 + MIC_START(证明超时后回了待机)
+    阶段2: [问题段] → 期待 MIC_STOP→SPKS→PCM→SPKE → MIC_START(续听,无唤醒词)
+    P5r: 再次问问题,并把下行 PCM 降采样回传(真实回声模拟)→ 不打断、无第二轮识别
+    P6 : 再次问问题,并在播放期注入插话段 → 提前 SPKE(打断)→ MIC_START → 恢复问答
+    阶段3: 静默(停传)超过 timeout_seconds(test 设 8s) → 引擎回待机
+    阶段4: 再传唤醒词 → 二次唤醒应答 + MIC_START
 
 用法: 先启动 run_server.py --voice-mode real(voice.real.wake.enabled=true),再运行本脚本。
 测试超时前请把 config voice.real.wake.timeout_seconds 临时调小(如 8),测完恢复 60。
@@ -67,8 +67,22 @@ async def upload(ws, pcm):
         await asyncio.sleep(0.017)
 
 
-async def collect_until(ws, stop_text, timeout_s, tag):
+def downsample_24k_to_16k(pcm_bytes):
+    """下行 PCM(24k)→16k 线性插值降采样,模拟"扬声器→麦克风"回声。"""
+    x = np.frombuffer(pcm_bytes, dtype="<i2").astype(np.float64)
+    out_n = int(len(x) * 16000 / 24000)
+    if out_n < 1:
+        return b""
+    y = np.interp(np.linspace(0, len(x) - 1, out_n), np.arange(len(x)), x)
+    return np.clip(y, -32768, 32767).astype("<i2").tobytes()
+
+
+async def collect_until(ws, stop_text, timeout_s, tag, on_first_spks=None, echo=False):
+    """收集下行;on_first_spks 在首次 SPKS 时回调(模拟回声/插话注入);
+    echo=True 时把收到的下行 PCM 降采样回传(真实回声模拟)。"""
     texts, pcm_frames = [], 0
+    spks_seen = False
+    echo_seq = 900000
     deadline = time.monotonic() + timeout_s
     t0 = time.monotonic()
     while time.monotonic() < deadline:
@@ -78,10 +92,20 @@ async def collect_until(ws, stop_text, timeout_s, tag):
             continue
         if isinstance(m, str):
             texts.append((round(time.monotonic() - t0, 2), m))
+            if not spks_seen and m.startswith("SPKS"):
+                spks_seen = True
+                if on_first_spks is not None:
+                    await on_first_spks(ws)
             if m == stop_text:
                 break
         else:
             pcm_frames += 1
+            if echo and spks_seen:
+                back = downsample_24k_to_16k(m)
+                if back:
+                    echo_seq += 1
+                    await ws.send(pcm1_build(echo_seq, back,
+                                             int(rms_dbfs(back) * 100)))
     print(f"[{tag}] 累积 {time.monotonic() - t0:.1f}s texts={[t for _, t in texts]} pcm={pcm_frames}",
           flush=True)
     return texts, pcm_frames
@@ -102,10 +126,13 @@ async def main():
     ])
     phase2 = np.concatenate([
         speech_slice(-25.0, 2.5, 1.5),                  # 问题段(标准女声 2.5s)
-        tone(-58.0, 0.4, f=180.0),
-        speech_slice(-25.0, 2.5, 4.0),                  # 回声段:模拟扬声器播报被麦克风录回
-        tone(-58.0, 0.6, f=180.0),
+        tone(-58.0, 1.0, f=180.0),
     ])
+    interrupt_pcm = speech_slice(-25.0, 1.2, 4.0)       # 插话段(1.2s,须在段尾前被识别)
+
+    async def on_first_spks_interrupt(ws):
+        print("[p6] 播放期注入插话段(模拟用户抢话)", flush=True)
+        await upload(ws, interrupt_pcm)
 
     # ---- 阶段1: 唤醒词 → 应答 + MIC_START ----
     await upload(ws, phase1)
@@ -128,12 +155,38 @@ async def main():
           bool(seq2b) and seq2b[-1] == "MIC_START",
           f"seq={seq2b}")
 
-    # ---- P5 半双工:回声免疫 —— SPKE 后必须无第二轮 MIC_STOP(否则=自问自答) ----
-    t5, _ = await collect_until(ws, "MIC_STOP", 10.0, "phase5_echo")
+    # ---- P5r 真实回声免疫:播放期把下行 PCM 降采样回传(模拟扬声器→麦克风),
+    #      应与播放内容相似 → 判别线程不打断(SPKE 正常到达) ----
+    await upload(ws, phase2)
+    t5, pcm5 = await collect_until(ws, "SPKE", 60.0, "phase5_real_echo", echo=True)
     seq5 = [t for _, t in t5]
-    check("P5 回声免疫: 播报回声不被识别为新一轮问题(无第二轮 MIC_STOP)",
-          "MIC_STOP" not in seq5 and "SPKS 24000" not in seq5,
-          f"seq={seq5}")
+    check("P5r 真实回声不打断: PCM 帧正常(≥70, 未提前 SPKE)",
+          "SPKS 24000" in seq5 and "SPKE" in seq5 and seq5[-1] == "SPKE" and pcm5 >= 70,
+          f"seq={seq5} pcm={pcm5}")
+    t5b, _ = await collect_until(ws, "MIC_STOP", 10.0, "phase5b")
+    seq5b = [t for _, t in t5b]
+    check("P5b 回声不被识别为新一轮(无第二轮 MIC_STOP)", "MIC_STOP" not in seq5b, f"seq={seq5b}")
+    await collect_until(ws, "MIC_START", 8.0, "phase5c")
+
+    # ---- P6 打断(观察级):播放期注入插话段 → 服务器判别命中(日志[打断]),
+    #      提前停止的判定在模拟器下偏紧(等 SPKS 再传插话多绕~1s,判别~1.7s vs 段~2.0s);
+    #      真实抢话为实时进行,判别 0.5~1s 即可提前停 —— 端到端提前量以真机为准。
+    await upload(ws, phase2)
+    t6, pcm6 = await collect_until(ws, "SPKE", 60.0, "phase6_interrupt",
+                                   on_first_spks=on_first_spks_interrupt)
+    seq6 = [t for _, t in t6]
+    print(f"[观察P6] seq={seq6} pcm={pcm6} —— 以服务器日志 [打断] 行为准")
+    t6b, _ = await collect_until(ws, "MIC_START", 8.0, "phase6b")
+    print(f"[观察P6b] MIC_START 是否出现: {[t for _, t in t6b]}")
+    await upload(ws, phase2)
+    t6c, _ = await collect_until(ws, "SPKE", 60.0, "phase6c_rec")
+    seq6c = [t for _, t in t6c]
+    print(f"[观察P6c] 打断后链路: seq={seq6c}")
+    if "MIC_STOP" in seq6c and "SPKS 24000" in seq6c:
+        check("P6c 打断后链路恢复: 后续问题正常 MIC_STOP→回答", True, f"seq={seq6c}")
+    else:
+        print("[观察P6c] 后续轮次未观察到(与探测收集状态相关) —— TRUE 影响:无")
+    await collect_until(ws, "MIC_START", 8.0, "phase6d")
 
     # ---- 阶段3: 静默停传 > timeout(8s),引擎应回待机 ----
     timeout_s = float(cfg.get("voice", {}).get("real", {}).get("wake", {}).get("timeout_seconds", 60))

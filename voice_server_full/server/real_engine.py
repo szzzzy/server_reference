@@ -114,6 +114,58 @@ class StreamingAsr:
         return text, self.first_partial, self.elapsed
 
 
+class _InterruptDetector(threading.Thread):
+    """播放期"抢话检测"线程（零依赖·语义回放免疫）。
+
+    原理：服务器自知道正在播放的 TTS 文本（参考信号）；播放期间独立消费上行帧，
+    流式 ASR（600ms 块）增量识别，与播放文本做相似度比对 —— 识别出与播放内容明显
+    不同的内容且字数足够 → 判定用户插话（set hit_event）。不需要 AEC 库/声学路径
+    估计；回声（≈播放内容）相似度高，不会误打断。
+
+    生命周期：_playback_begin(text) 启动、_playback_end() 停止；daemon 线程，
+    停止依赖"设备持续上传 → read 立即返回"（新版固件满足）。
+    """
+
+    def __init__(self, stream, model, play_text, hit_event, min_chars, min_similarity):
+        super().__init__(daemon=True)
+        self._stream = stream
+        self._model = model
+        self._play_text = _normalize_wake(play_text)
+        self._hit = hit_event
+        self._min_chars = max(2, int(min_chars))
+        self._min_sim = float(min_similarity)
+        self._stop_flag = threading.Event()   # 注意: 不能叫 _stop(覆盖 Thread._stop 内部方法)
+
+    def stop(self):
+        self._stop_flag.set()
+
+    def run(self):
+        try:
+            import numpy as np
+            from difflib import SequenceMatcher
+            from board_serial_asr_test import read_frame
+            asr = StreamingAsr(self._model)
+            buf = []
+            while not self._stop_flag.is_set():
+                try:
+                    _, _, frame = read_frame(self._stream)
+                except Exception:
+                    break                     # 流关闭/停止:退出
+                buf.append(frame)
+                if len(buf) >= 15:            # 300ms 一块(15×320=4800 样本):判别粒度小,命中更快
+                    chunk = np.concatenate(buf[:15])
+                    buf = buf[15:]
+                    asr.on_chunk(chunk)
+                    text = _normalize_wake("".join(asr.parts))
+                    if len(text) >= self._min_chars:
+                        ratio = SequenceMatcher(None, text, self._play_text).ratio()
+                        if ratio < self._min_sim:
+                            self._hit.set()   # 与播放内容明显不同 → 用户插话
+                            return
+        except Exception:
+            pass                              # 判别失败不致命(等价于未打断)
+
+
 class RealVoiceEngine:
     """真实推理引擎,实现与 StubVoiceEngine 相同的引擎接口(可整体替换):
 
@@ -162,6 +214,14 @@ class RealVoiceEngine:
         self._floor = None                  # 动态底噪估计器(会话级;None=未启用/固定底噪)
         self._board_spks_active = False     # 下行 SPKS 是否已开(跨段连续播)
         self._playback_until = 0.0          # 半双工: 该时刻前不听/丢弃上行(扬声器回声余震)
+        # ---- 播放期抢话检测(零依赖·语义回放免疫,见 _InterruptDetector) ----
+        _icfg = self.real_cfg.get("interrupt") or {}
+        self._interrupt_enabled = bool(_icfg.get("enabled", True))
+        self._interrupt_min_chars = int(_icfg.get("min_chars", 2))
+        self._interrupt_min_similarity = float(_icfg.get("min_similarity", 0.5))
+        self._interrupt_hit = threading.Event()   # 播放期被 set = 用户抢话(打断)
+        self._detector = None                     # 当前播放期的判别线程
+        self._asr_model = None                    # 判别线程用的 ASR 模型(加载后赋值)
         self._first_spks_at = None          # 本轮首块音频下发的时刻(端点→首块计时用)
         self._turn_first_frame_at = None    # 本轮第一帧到达时刻(完整链路计时起点)
         self._history = []                  # 多轮对话历史[{user},{assistant}...],按 history_turns 截取
@@ -300,6 +360,7 @@ class RealVoiceEngine:
         # ---- 加载 ASR ----
         self.status = "loading_asr"
         asr, _, _ = load_paraformer(str(resolve(deps, models["asr"])), "auto")
+        self._asr_model = asr               # 供播放期抢话判别线程复用
         log.info("ASR 就绪")
 
         # ---- TTS 子进程 ----
@@ -393,7 +454,8 @@ class RealVoiceEngine:
             # ---- 半双工(无 AEC):SPKE 后 0.6s 内不听 —— 扬声器回声余震;
             #      播放期间(SPKS→SPKE)积累的上行也在这里一次性清掉,否则设备会把
             #      "我刚播的内容"录回去,服务器再识别 → 自问自答。
-            if time.monotonic() < self._playback_until:
+            #      判别线程未退出时不清(避免与另一读者并发操作流)。
+            if self._detector is None and time.monotonic() < self._playback_until:
                 self.stream.reset_input_buffer()
                 self._real_bytes_consumed = self.stream.real_bytes_total
                 self._short_sleep(0.1)
@@ -582,7 +644,7 @@ class RealVoiceEngine:
                     self._push_pcm(silence[off:off + 1200])
                 self._push_text("SPKE")
                 print("[下行] SPKE(空播报结束)", flush=True)
-                self._playback_until = time.monotonic() + 0.3   # 半双工: 零声播报后短暂不听
+                self._playback_end(0.3)   # 半双工: 零声播报后短暂不听
                 # 在线唤醒·持续对话:空轮后同样续听(不回待机);非唤醒模式按 mic_restart 决定
                 if self._wake_enabled or self.r.get("mic_restart_after_answer", False):
                     self._push_text("MIC_START")
@@ -612,7 +674,7 @@ class RealVoiceEngine:
                 if self._board_spks_active:
                     self._push_text("SPKE")
                     self._board_spks_active = False
-                    self._playback_until = time.monotonic() + 0.3   # 半双工
+                    self._playback_end(0.3)   # 半双工
                     print("[下行] SPKE(异常收尾)", flush=True)
             # ---- 完整链路计时(首帧上传 → SPKE 播完)----
             if self._turn_first_frame_at is not None:
@@ -828,9 +890,11 @@ class RealVoiceEngine:
                     "stream_dir": str(stream_dir),
                 }, ensure_ascii=False), encoding="utf-8")
                 print(f"[TTS] 段{seg_index}: {text[:40]}", flush=True)
-                segment_queue.put((request_id, stream_dir))
+                segment_queue.put((request_id, stream_dir, text))
 
             for sentence in sentence_chunks(streamer, fast_cut=fast_cut):
+                if self._interrupt_hit.is_set():
+                    break                    # 用户抢话:停止生成/切句/合成
                 response_pieces.append(sentence)
                 if first_token_seconds is None:
                     first_token_seconds = round(time.monotonic() - endpoint_wall, 3)
@@ -862,18 +926,36 @@ class RealVoiceEngine:
         seg_index = 0
         board_started = False
         last_ok = True
+        interrupted = False
         while True:
-            item = segment_queue.get()
+            if self._interrupt_hit.is_set():
+                if self._board_spks_active:
+                    # 播放中命中:由 _stream_tts_segment 打断出口完成 SPKE,这里收尾
+                    interrupted = True
+                    print("[打断] 回答被用户抢话中断 → 停止播放,进 LISTEN", flush=True)
+                else:
+                    # 残留命中(命中晚于段尾收尾):播放已完成,不算打断,不重复发命令
+                    print("[打断] 残留命中(已播完) → 忽略", flush=True)
+                break
+            try:
+                item = segment_queue.get(timeout=0.5)
+            except thread_queue.Empty:
+                continue                     # queue.Empty(threading) → import 包装
             if item is None:
                 break
-            request_id, stream_dir = item
+            request_id, stream_dir, seg_text = item
             seg_index += 1
             seg_started = time.monotonic()
             tts = self._stream_tts_segment(
                 queue, request_id, stream_dir,
-                start_board=(not board_started or not last_ok), end_board=False)
+                start_board=(not board_started or not last_ok), end_board=False,
+                play_text=seg_text)
             board_started = True
             last_ok = bool(tts.get("ok", False))
+            if tts.get("error") == "interrupted":
+                interrupted = True
+                print("[打断] 用户抢话(段内) → 停止播放,进 LISTEN", flush=True)
+                break
             seg_sec = round(time.monotonic() - seg_started, 2)
             seg_times.append(seg_sec)
             if tts_wall is None and self._first_spks_at is not None:
@@ -884,15 +966,17 @@ class RealVoiceEngine:
         if self._board_spks_active:
             self._push_text("SPKE")
             self._board_spks_active = False
-            self._playback_until = time.monotonic() + 0.6   # 半双工: 播报回声余震期不听
+            self._playback_end(0.6)   # 半双工: 播报回声余震期不听
             print("[下行] 全部段落播完 · SPKE", flush=True)
         # 连续对话模式(协议多轮要求):SPKE 后重发 MIC_START,设备重新进入 LISTENING
         # 继续下一轮;关闭时设备回 IDLE 等本地唤醒。
         # 在线唤醒·持续对话(wake.enabled): 同样在 SPKE 后发 MIC_START 续听 —— 唤醒一次后
         # 不再要求重新说唤醒词,直到空闲超时由引擎回待机。
-        if self._wake_enabled or self.r.get("mic_restart_after_answer", False):
+        # 打断(flexible)或正常续听都发 MIC_START(播放循环中断出口已确保 SPKE 先行)。
+        if interrupted or self._wake_enabled or self.r.get("mic_restart_after_answer", False):
             self._push_text("MIC_START")
-            print("[下行] MIC_START(连续对话模式,设备→LISTENING)", flush=True)
+            print("[下行] MIC_START(打断进 LISTEN)" if interrupted
+                  else "[下行] MIC_START(连续对话模式,设备→LISTENING)", flush=True)
 
         response = "".join(response_pieces).strip()
         self._remember(f"A{turn}: {response[:80]}")
@@ -914,6 +998,30 @@ class RealVoiceEngine:
         self._append_row(result_csv, row)
         return row
 
+    # ---------------- 播放期抢话检测(零依赖语义回放免疫) ----------------
+
+    def _playback_begin(self, text):
+        """SPKS 发出前调用:登记播放文本并启动抢话判别线程(若有文本且开启)。"""
+        self._interrupt_hit.clear()
+        if self._detector is not None:
+            self._detector.stop()
+            self._detector = None
+        if self._interrupt_enabled and self._asr_model is not None and str(text or "").strip():
+            self._detector = _InterruptDetector(
+                self.stream, self._asr_model, text, self._interrupt_hit,
+                self._interrupt_min_chars, self._interrupt_min_similarity)
+            self._detector.start()
+
+    def _playback_end(self, safety_s=0.6):
+        """SPKE 发出后调用:等待判别线程真正退出(≤1s,read 有 0.25s 超时)
+        + 半双工余震窗口(该时刻前不听)。保证播放期结束后流上只有一个读者(主循环)。"""
+        if self._detector is not None:
+            d = self._detector
+            self._detector = None
+            d.stop()
+            d.join(timeout=1.0)
+        self._playback_until = time.monotonic() + safety_s
+
     def _speak_prompt(self, text, tts_base, queue, tts_dir, tag):
         """单段 TTS 播报(唤醒应答/提示语):非流式合成完整 wav → SPKS + PCM ≤1200B/帧 + SPKE。
 
@@ -930,18 +1038,25 @@ class RealVoiceEngine:
             rate = w.getframerate()
         if not pcm:
             raise RuntimeError("唤醒应答 TTS 产物为空")
+        self._playback_begin(text)                 # 应答也是播放:进行中可被用户抢话打断
         self._push_text(f"SPKS {rate}")
         self._board_spks_active = True
         for off in range(0, len(pcm), 1200):
+            if self._interrupt_hit.is_set():
+                self._push_text("SPKE")
+                self._board_spks_active = False
+                self._playback_end(0.3)
+                print("[打断] 唤醒应答被用户抢话 → 停止应答,进 LISTEN", flush=True)
+                return
             self._push_pcm(pcm[off:off + 1200])
             time.sleep(0.02)
         self._push_text("SPKE")
         self._board_spks_active = False
-        self._playback_until = time.monotonic() + 0.6   # 半双工: 应答回声余震期不听
+        self._playback_end(0.6)                     # 半双工: 应答回声余震期不听
         print(f"[下行] 唤醒应答播报完成: {text[:24]} ({len(pcm) / 2 / rate:.1f}s)", flush=True)
 
     def _stream_tts_segment(self, queue, request_id, stream_dir, start_board=True,
-                            end_board=True):
+                            end_board=True, play_text=""):
         """把 TTS 子进程合成的一段(S 句)流式下发 WSS:SPKS <rate> + PCM 帧(≤1200B) + SPKE。
 
         与 TTS 子进程的通信协议(全是落盘文件,无共享内存):
@@ -974,10 +1089,18 @@ class RealVoiceEngine:
             if pcm is not None:
                 if not spoke and start_board:
                     spoke = True
+                    self._playback_begin(play_text)       # 登记播放文本 + 启动抢话判别
                     self._push_text(f"SPKS {rate}")
                     self._board_spks_active = True
                     if self._first_spks_at is None:
                         self._first_spks_at = time.monotonic()
+                if self._interrupt_hit.is_set():
+                    # 用户抢话:立即停播(SPKE),设备收 MIC_START 后停止扬声器
+                    self._push_text("SPKE")
+                    self._board_spks_active = False
+                    self._playback_end(0.3)
+                    print("[打断] 用户抢话 → 停止播放(SPKE 提前),等待进入 LISTEN", flush=True)
+                    return {"ok": False, "error": "interrupted"}
                 if self.sink_pcm:
                     data = pcm if len(pcm) % 2 == 0 else pcm[:-1]
                     for off in range(0, len(data), 1200):
@@ -1001,7 +1124,7 @@ class RealVoiceEngine:
                 if end_board and self._board_spks_active:
                     self._push_text("SPKE")
                     self._board_spks_active = False
-                    self._playback_until = time.monotonic() + 0.6   # 半双工
+                    self._playback_end(0.6)   # 半双工: 段末独播收尾
                 print(f"[下行] 段完成 · {next_index} 块音频"
                       + (f" · SPKE(段末)" if end_board and not self._board_spks_active else ""),
                       flush=True)
@@ -1012,7 +1135,7 @@ class RealVoiceEngine:
         if self._board_spks_active:
             self._push_text("SPKE")
             self._board_spks_active = False
-            self._playback_until = time.monotonic() + 0.6   # 半双工
+            self._playback_end(0.6)   # 半双工
             log.warning("TTS 段超时,已发 SPKE: %s", request_id)
         else:
             log.warning("TTS 段超时: %s", request_id)

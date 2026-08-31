@@ -82,6 +82,11 @@
       "system_prompt": "",
       "history_turns": 0,
       "max_new_tokens": 80,
+      "interrupt": {
+        "enabled": true,
+        "min_chars": 2,
+        "min_similarity": 0.5
+      },
       "wake": {
         "enabled": true,
         "words": ["你好小科"],
