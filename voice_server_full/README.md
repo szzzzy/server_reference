@@ -147,7 +147,8 @@ start_server_real.cmd
 
 ## 6. 配置要点(server/config.json —— 服务器实际使用的唯一配置文件)
 
-面向**纯网络语音链路**,不含固件烧录/唤醒词/串口/OTA 痕迹。`run_server.py` 默认加载的就是这份;启动后所有语音参数修改都在这里。
+面向**线上唤醒版语音链路**(设备端无本地唤醒词,固件 WSS 认证后持续上传)。`run_server.py`
+默认加载的就是这份;启动后所有语音参数修改都在这里。
 
 **ASR / LLM / TTS 三段:**
 
@@ -156,10 +157,12 @@ start_server_real.cmd
 | `voice.real.models.asr` | `models/paraformer-zh-streaming` | ASR 模型目录(相对 `deps_root`) |
 | `voice.real.models.llm` | `models/Qwen3-4B-Instruct-2507` | LLM 模型(要换速可一行改成 Qwen2.5-1.5B-Instruct) |
 | `voice.real.models.tts` | `models/CosyVoice2-0.5B` | TTS 模型目录 |
-| `conversation` | `system_prompt` / `max_new_tokens=80` / `history_turns=0` | **LLM 参数**:通用语音助手提示词(无场景设定;留空=纯一问一答)/回答字数上限/历史轮数 |
-| `vad`(在 `voice.real.vad`) | `endpoint_ms=600`、`start/end_above_db`、`start_active_ms=120`、`start_window_ms=300`、`active_penalty=4`、`max_seconds=15` | **ASR 侧 VAD 全部参数**(说起/说完判定;`endpoint_ms` 越小反应越快) |
+| `conversation` | `system_prompt` / `max_new_tokens=60` / `history_turns=10` | **LLM 参数**:通用语音助手提示词/回答字数上限/历史轮数 |
+| `wake`(在 `voice.real.wake`) | `words=["你好小科"]`、`prompt`、`timeout_seconds=60`、`listen_seconds=8` | **线上唤醒**:词表(默认仅"你好小科",同音容错内置)/应答文本/空闲超时/待机段上限 |
+| `interrupt`(在 `voice.real.interrupt`) | `enabled / min_chars=2 / min_similarity=0.5` | **播放期打断**(语义回放免疫):识别内容与播放文本相似度低于阈值且 ≥2 字即抢话 |
+| `vad`(在 `voice.real.vad`) | `start_above_db=5`、`end_above_db=3`、`start_active_ms=120`、`endpoint_ms=400`、`max_seconds=15` + `dynamic_floor`(默认开) | **对话态 VAD**(滞回:开始严/结束松)+ **动态底噪**(双窗自适应阈值,启用时跳过开机静态校准) |
 | `tts` | `role`/`reference_manifest`/`fallback_reference_*` | **TTS 音色**(零样本克隆参考音频+文本);音色换这里 |
-| `voice_control` | `first_tts_fast_cut_chars=12`、`first_tts_segment_chars=12`、`later_tts_segment_chars=40` | **切句/分段**:首段快切与送 TTS 字数 |
+| `voice_control` | `first_tts_fast_cut_chars=10`、`first_tts_segment_chars=10`、`later_tts_segment_chars=40` | **切句/分段**:首段快切与送 TTS 字数 |
 
 **网络与资源:**
 
@@ -169,32 +172,32 @@ start_server_real.cmd
 | `deps_root`(顶层 + `voice.real`) | 模型/音色/venv/CosyVoice 源码所在根(当前指向原项目根;自包含时改为本包根) |
 | `file_server.port` | 状态台 `https://<IP>:8443/__debug` |
 | `mqtt.enabled` | `false`(默认禁用 OTA/命令控制面;需要烧录/升级控制时改 `true`) |
-| `voice.mic_restart_after_answer` | `false`(默认:一轮结束设备回 IDLE 等本地唤醒;`true`=SPKE 后重发 MIC_START 连续对话) |
+| `voice.mic_restart_after_answer` | `true`(SPKE 后重发 MIC_START 连续对话;线上唤醒模式下即"唤醒一次·持续对话") |
 | `paths.server_cert/server_key` | TLS 证书(指向 `../certs/server/…`) |
 
 ## 7. 听—想—说 协议适配(ESP32 Julia 设备)
 
-设备本地 WakeNet 检测到"你好小智"后自行上传 PCM1 帧;服务端**不识别唤醒词**,只做对话流程:
+新版固件无本地唤醒词,WSS 认证后**持续上传 PCM1**;服务器线上判定唤醒词,之后一次唤醒持续对话:
 
 ```
-设备(本地唤醒) → WSS 上传 PCM1 帧 ──> 服务器
-                                      ├─ VAD 能量端点:判定"用户说完了"
-                                      ├─ 立即回发文本帧 MIC_STOP(设备→THINKING)   ← 必须发送
+设备(持续上传) → WSS 上传 PCM1 帧 ──> 服务器(待机态)
+                                      ├─ 流式 ASR(600ms 块)+ 同音容错:判定"你好小科"
+                                      ├─ 命中 → TTS 应答"我在，请讲。" → 丢弃应答期上行(回声)
+                                      ├─ MIC_START(设备→LISTEN)
+                                      ├─ VAD 能量端点:判定"用户说完了" → MIC_STOP(设备→THINKING)
                                       ├─ ASR 最终识别 → Qwen3 生成(流式切句)
                                       ├─ SPKS 24000(开播,采样率=TTS 实际 24000)
                                       ├─ WSS 二进制帧:mono PCM16(设备播报+嘴型,UI→SPEAKING)
                                       ├─ SPKE(播报结束)
-                                      └─ (默认)不再发 MIC_START → 设备回 IDLE 等下次唤醒
+                                      └─ MIC_START(续听——唤醒一次·持续对话;60s 空闲超时回待机)
 ```
 
 - 文本帧(MIC_START/MIC_STOP/SPKS/SPKE)均为独立精确帧;下行 PCM 只出现在 SPKS 之后、SPKE 之前;
-- **连续对话(多轮)**: `voice.mic_restart_after_answer = true`(默认)时 SPKE 后自动重发 MIC_START,
-  设备回到 LISTENING 继续下一轮;`conversation.history_turns` 控制 LLM 携带几轮上下文(默认 2)。
-  关闭则设备回 IDLE 等下次本地唤醒。
-- 实测(2026-08-27): 模拟器 voice 场景 7/7 PASS,下行序列 `['MIC_STOP', 'SPKS 24000', 'SPKE']`,
-  PCM 帧夹在 SPKS/SPKE 之间;两轮对话验证(server/voice_multiturn_probe.py) PASS:
-  每轮 `['MIC_STOP','SPKS 24000','SPKE','MIC_START']`,第二轮正常带上下文回答,
-  验证记录 `server/runs/20260827_175109/`。
+- **播放期打断**:播放中用户抢话 → 服务器停止旧 TTS + SPKE + MIC_START(设备 EVT_INTERRUPT 进 LISTEN),
+  由 `voice.real.interrupt` 控制;无 AEC 时 v1 不保留插话全文;
+- **半双工**:SPKS→SPKE 期间不回采上行,SPKE 后 0.6s 余震丢弃,防自问自答(回声免疫);
+- 实测(2026-08-31): 隔离端口全链路 6/6(唤醒应答/无唤醒词问题轮/续听/真实回声不打断/超时二次唤醒/打断后链路),
+  动态底噪真机 A/B 恢复轮 2.16s 起始 / 4.92s 端点;验证记录 `server/runs/20260831_*`。
 
 ---
 

@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""真实语音引擎(RealVoiceEngine,R1–R3):WSS PCM1 → VAD/ASR → Qwen3 一问一答 → TTS → WSS 下行。
+"""真实语音引擎(RealVoiceEngine):WSS PCM1 → 线上唤醒/VAD/ASR → Qwen3 问答 → TTS → WSS 下行。
 
 完整链路编排(本文件是"编排层",具体推理实现都在 engine/ 目录被 import 复用):
-  上行: 设备/WSS 客户端 → WssAdapter(二进制 PCM1 帧) → on_frame()
+  上行: 设备/WSS 客户端(新版固件 WSS 认证后持续上传 PCM1) → WssAdapter → on_frame()
         → RingBuffer(字节流兼容层,语音停流自动补静音帧)
         → board_serial_asr_test.capture_until_endpoint()(能量 VAD,选出"一段完整的话")
         → board_serial_asr_test.recognize()(FunASR Paraformer 流式,0.5s 内出文本)
@@ -11,7 +11,11 @@
   下行: _stream_tts_segment 轮询 chunk_*.pcm → SPKS <rate> + PCM(≤1200B/帧,≈1.14×实时节奏)
         + SPKE,经 set_sink 注册的回调广播到所有在线 WSS 客户端(线程安全调度)。
 
-问答形态: 默认一问一答(无唤醒词、无对话状态机、无历史);voice.real.system_prompt 可配。
+会话形态(2026-08-31,新版链路):
+  - 待机态: 服务器流式 ASR 判定唤醒词"你好小科"(同音容错,600ms 块级),命中→应答→MIC_START;
+  - 唤醒态: 唤醒一次·持续对话 —— 每轮 SPKE 后自动 MIC_START 续听,空闲 60s 超时回待机;
+  - 播放期: 半双工(不回采回声)+ 语义回放免疫打断(识别内容≠播放文本 → 提前 SPKE+MIC_START);
+  - 动态底噪: 双窗估计器自适应阈值(默认开),启用时跳过开机静态校准。
 运行要求: 本模块与整个 run_server 需用 .venv_5090_llm 的 Python(有 torch/transformers/funasr)。
 """
 import csv
@@ -318,7 +322,7 @@ class RealVoiceEngine:
             self.status = "error"
 
     def _load_and_answer_loop(self):
-        """引擎主循环:加载三大模型 → 常驻 → "采集→VAD→MIC_STOP→ASR→问答→下行" 无限循环。
+        """引擎主循环:加载三大模型 → 常驻 → 线上唤醒状态机(待机态↔唤醒态)无限循环。
 
         加载顺序(考虑显存与依赖):
           ① ASR(FunASR Paraformer,GPU 主进程内);
@@ -326,17 +330,20 @@ class RealVoiceEngine:
           ③ LLM(Qwen3-4B,transformers,GPU 主进程内)。
         此后所有模型常驻显存,循环里只做推理,不再重载。
 
-        每轮流程(while not stop),协议适配 ESP32 Julia "听—想—说":
-          等新字节 → 首轮先做背景校准(_calibrate_background)
-          → capture_until_endpoint:能量 VAD 判定"用户说完了"(设备本地 WakeNet 已唤醒,
-            自行上传 PCM1;服务端不识别唤醒词)
-          → 立即下发 MIC_STOP 文本帧(设备→THINKING,必须发送)
-          → recognize(ASR 最终识别)
-          → _answer_qa: Qwen3 流式回答 + TTS 合成
-             (SPKS <24000> 开播 → PCM16 二进制帧 → SPKE 收尾;
-              可选连续对话模式: SPKE 后重发 MIC_START,默认关闭,设备回 IDLE)
-          → 记一轮指标 → 清残留静音帧。
-        """
+        主循环流程(while not stop;新版固件 WSS 认证后持续上传 PCM1):
+          - 空闲超时检查(唤醒态 60s 无活动 → 回待机);
+          - 待机态(voice.real.wake.enabled 且未唤醒): 唤醒参数 VAD 判一段 → 仅"判了起始"
+            的段做流式 ASR + finish 冲刷(600ms 块级,命中 early-stop)→ 同音容错匹配
+            "你好小科" → 命中: TTS 应答("我在，请讲。") → 丢弃应答期上行(回声) →
+            MIC_START(设备→LISTEN) → 进入唤醒态;未命中继续守听(不下发命令);
+          - 唤醒态(= 原有"听—想—说"): capture_until_endpoint 判一句
+            → MIC_STOP(设备→THINKING) → recognize → _answer_qa
+              (SPKS<PCM>SPKE 下行;SPKE 后自动 MIC_START 续听 —— 唤醒一次·持续对话)
+            → 记一轮指标 → 清残留;
+          - 播放期: 半双工(SPKS→SPKE 不消费上行 + SPKE 后 0.6s 余震丢弃)+
+            语义回放免疫打断(_InterruptDetector 300ms 块判别,抢话即提前 SPKE+MIC_START);
+          - 动态底噪启用时跳过开机静态校准(bg 由估计器预语音段自学)。
+                """
         # 包根 = 本文件(server/)的父目录;推理代码固定从包内 engine/ 导入,
         # 不依赖调用方传入的 project_root(避免被外部同名模块劫持)。
         package_root = Path(__file__).resolve().parent.parent

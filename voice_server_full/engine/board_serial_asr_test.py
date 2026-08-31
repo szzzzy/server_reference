@@ -355,6 +355,8 @@ def capture_until_endpoint(
       floor_tracker                 NoiseFloorTracker 实例(动态底噪,默认 None=固定底噪,行为不变)。
                                     非 None 时每帧喂给估计器,start/end 阈值随 bg_t 变化:
                                     speech_started 前估计器持续更新,判定开始后本轮冻结。
+      stop_event                    threading.Event(可选):置位后下一帧即提前退出(early-stop),
+                                    用于"检测到目标即可不再等段尾"的场景(流式唤醒命中即时响应)。
 
     起始检测:读帧 → 帧内活跃样本计数 → 300ms 滑窗(窗口滚出则扣除) →
       活跃样本 ≥ 120ms → speech_started=True,并把 speech_start_sample 回退到窗口起点。

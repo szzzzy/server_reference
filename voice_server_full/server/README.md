@@ -1,4 +1,4 @@
-﻿# 虚拟测试服务器(独立构建,不动现有代码)
+# 虚拟测试服务器(独立构建,不动现有代码)
 
 按固件通信协议基线实现的服务器虚拟测试端 —— **不与现有语音流水线代码耦合**:
 现有 `voice_daemon.py` / `board_serial_asr_test.py` / `realtime_pipeline.py` 等零改动;
@@ -96,9 +96,12 @@ network\server\start_virtual_server.cmd
 - **透传语义**:PCM1 帧格式、命令文本与固件协议一一对应;推理层接入只发生在 voice_bridge 的 real 引擎;
 - **可插拔**:broker 可外接(`--no-broker`+config mqtt.host);TLS 可用 certs/ 或客户证书。
 
-## 七、真实语音引擎(一问一答,R1–R3 已完成并实测)
+## 七、真实语音引擎(线上唤醒 + 持续对话,R1–R3+ 已完成并实测)
 
-**工作流**:WSS PCM1 → RingBuffer(字节流兼容层)→ 现有 VAD/ASR → Qwen3(无提示词、无历史、一问一答)→ 分句 TTS 子进程 → SPKS+PCM+SPKE 下行。设计书:`语音工作流设计.md`。
+**工作流**:WSS PCM1(新版固件认证后持续上传)→ RingBuffer(字节流兼容层)→ 线上唤醒状态机
+(待机态流式 ASR 判"你好小科" + 同音容错 → 应答 → MIC_START)→ 唤醒态 VAD/ASR →
+Qwen3 → 分句 TTS 子进程 → SPKS+PCM+SPKE 下行;播放期半双工 + 语义回放免疫打断(抢话提前
+SPKE+MIC_START);动态底噪自适应阈值(默认开)。设计书:`语音工作流设计.md` + `docs/算法链路说明.md`。
 
 ### 启动(必须用 GPU 环境 python)
 
@@ -127,20 +130,22 @@ network\server\start_virtual_server.cmd
 ### 关键机制
 
 - **字节流兼容层 RingBuffer**:实现 serial 同形接口(read/reset_input_buffer/flush),并**在语音停流后自动补合成静音帧(默认 1.4 s,按 endpoint_ms 配置)**,使现有 `capture_until_endpoint` 的尾部静音端点逻辑照常生效(这是 WSS"推送帧"与串口"持续流"适配的关键);
-- **一问一答**:无唤醒词/无对话状态机/无系统提示词(`voice.real.system_prompt` 默认空;`max_new_tokens` 默认 180,建议按需调小到 60–120 以快速回应);
+- **会话形态(默认配置)**:线上唤醒"你好小科"(服务器流式 ASR + 同音容错,见 `voice.real.wake`)+ **唤醒一次·持续对话**(SPKE 后自动 MIC_START,60s 空闲超时回待机);
+- **播放期**:半双工(不回采扬声器回声)+ **语义回放免疫打断**(识别内容 ≠ 播放文本 → 提前 SPKE+MIC_START,见 `voice.real.interrupt`);无 AEC,打断不保留用户插话全文(v1);
+- **动态底噪**:`voice.real.vad.dynamic_floor`(默认开,双窗自适应阈值,启用时跳过开机静态校准);
 - **分句**:重建版 `_sentence_chunks`(原版含面向控制台的 print,在 GBK 控制台遇 emoji 会崩溃 → 不能直接复用,按规则重建,逻辑一致);
 - **并发**:WSS 异步收发;采集/ASR/Qwen/TTS 顺序在 GPU 上串行(与现状一致);下行经 `call_soon_threadsafe` 调度到事件循环广播。
 
 ### 已知边界
 
 - 客户端断开后:下行帧被丢弃(合成继续,属正常);
-- 每问独立(history_turns=0);回答风格如需简短,调 `max_new_tokens` 或加 system_prompt;
-- 板卡上传模式(MICS 触发 / MICW 持续)—— 服务器两种都兼容,首条命令差异只是配置。
+- 播放期间用户不能抢话的同时保留全句(v1 丢弃插话前半句;v2 拼接/AEC);
+- 板卡上传模式:新版固件认证后持续上传(MICS 被忽略);旧固件 MICS 触发/MICW 持续两模式仍兼容。
 
 ### 与新版 PROTOCOL.md(设备侧实际实现)的一致性
 
 - **权威协议参考**:项目根 `PROTOCOL.md`(julia-fused-base 实际实现);
-- **本地唤醒词**:设备带本地唤醒词(如"你好小智")→ 设备自触发开麦(MIC_START 等效),**服务器无需主动发 MIC_START**,引擎即收即答;
+- **线上唤醒**:设备无本地唤醒词 → 服务器判"你好小科"→ MIC_START(设备 LISTEN);MIC_STOP 只结束本轮 LISTEN 不关 PCM;播放期打断 = 服务器停止旧 TTS + MIC_START(设备 EVT_INTERRUPT 进 LISTEN);
 - **vcmd(MQTT)命令集**:`FILE_SEND/MIC_START/MIC_STOP/MICW/MICS/SPKV`——**不含 SPKS/SPKE/SPKT**(那些只走 WSS 下行);服务器默认只在 WSS 发语音命令,无冲突;
 - **固件镜像头**:`make_test_artifacts.py` 生成的 app.bin 带 `project_name=julia-ai`(PROTOCOL.md §3.5 要求);
 - 协议自测断言全过(OTA 7/7、Audio 16/16、Voice 7/7 实测)。
