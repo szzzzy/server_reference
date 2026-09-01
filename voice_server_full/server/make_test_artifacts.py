@@ -1,7 +1,7 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """生成虚拟测试产物:固件镜像 + 音频素材,并写出 releases/manifest.json。
 
-用法(在 network/server 目录):
+用法(在 voice_server_full/server 目录):
   python make_test_artifacts.py                    # 自动取本机 IP
   python make_test_artifacts.py --addr myhost.com  # 指定服务器地址(须与固件 CONFIG_JULIA_SERVER_ADDR 一致)
 """

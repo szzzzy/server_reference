@@ -15,7 +15,7 @@ HERE = Path(__file__).resolve().parent
 
 
 def project_root():
-    # 独立目录:network/server 位于项目根下两级
+    # 包根=voice_server_full(server/ 的父级,位于项目根下两级)
     return HERE.parents[1]
 
 

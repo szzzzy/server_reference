@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """语音桥:WSS 上行 PCM1 帧/命令 → 语音引擎;下行命令/PCM → WSS。
 
 模式(独立构建,不修改任何现有文件):
@@ -94,7 +94,7 @@ class StubVoiceEngine:
 
 
 class RealVoiceEnginePlaceholder:
-    """真实推理引擎= network/server/real_engine.py(独立模块,import 复用现有代码)。"""
+    """真实推理引擎= voice_server_full/server/real_engine.py(独立模块,import 复用现有代码)。"""
 
     def __init__(self):
         raise NotImplementedError("real 引擎请使用 real_engine.RealVoiceEngine")

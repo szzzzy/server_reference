@@ -10,7 +10,7 @@
 
 - 板卡只负责采集 PCM 音频（20ms/帧，16kHz）和播放 PCM（24kHz），不做任何 AI 推理；
 - 5090 电脑上跑完整链路：**环境 VAD → FunASR(Paraformer-online) → Qwen3-4B → 按标点分句 → CosyVoice2 → 回板卡扬声器**；
-- 当前形态是"唤醒词 + 对话状态机"（V5 两级硬件唤醒），另有网络化改造分支（`network/server/`，MQTT/HTTPS/WSS 三种通道）。
+- 当前形态是"唤醒词 + 对话状态机"（V5 两级硬件唤醒），线上服务器版本为 `voice_server_full`（WSS 语音 + HTTPS 文件 + MQTT 控制面三种通道）。
 
 ---
 
@@ -172,7 +172,7 @@ TTS 工作目录：`next_stage/full_pipeline_5090/runs/<时间戳>/tts_queue/`�
 | `next_stage/voice_sleep_v5_5090/config.json` | V5 配置（含 voice_control） | — |
 | `config.json` / `next_stage/full_pipeline_5090/config.json` | V4 联调配置（含三模式 VAD） | — |
 | `tts_roles_5090/results/reference_manifest.json` | TTS 音色参考（角色→wav+文本） | — |
-| `network/server/real_engine.py` | **网络化版本**的真实语音引擎（WSS 一问一答，复用同一套 ASR/LLM/TTS） | `RealVoiceEngine` |
+| `voice_server_full/server/real_engine.py` | **线上网络版本**的真实语音引擎（WSS 一问一答，复用同一套 ASR/LLM/TTS） | `RealVoiceEngine` |
 
 版本关系：
 
@@ -182,7 +182,7 @@ V5 两级硬件唤醒:  next_stage/voice_sleep_v5_5090/voice_daemon.py（当前�
      ├─ 联调交互版(旧): next_stage/full_pipeline_5090/*（00_启动完整语音对话.bat 用）
      ├─ 稳定快照:       next_stage/full_pipeline_5090_cli_stable_20260823/*
      └─ 被 V5 import:   next_stage/full_pipeline_auto_5090/realtime_pipeline.py
-网络化改造:        network/server/*（真机联调前先用板卡模拟器验证协议）
+网络化/线上服务器: voice_server_full/server/*（真机联调前先用板卡模拟器验证协议）
 ```
 
 > ⚠️ 根目录 `voice_sleep_v5_5090/`（有 start_v5_visible.cmd 等 bat）是**启动器目录**，里面的 `voice_daemon.py`/`config.json` 是更老的副本；`start_v5_visible.cmd` 实际运行的是 `next_stage/voice_sleep_v5_5090/voice_daemon.py`。改代码请改 `next_stage` 下的，不要改根目录副本。
@@ -225,7 +225,7 @@ V5 两级硬件唤醒:  next_stage/voice_sleep_v5_5090/voice_daemon.py（当前�
 | `00_RUN_V5_TWO_STAGE_WAKE.bat` | **V5 可见测试**（当前推荐） |
 | `voice_sleep_v5_5090/install_autostart.cmd` / `start_voice_daemon.cmd` | V5 随 Windows 登录自启（vbs 隐藏窗口 + status 文件） |
 | `voice_sleep_v5_5090/check_status.cmd` | 看 daemon 状态（`voice_daemon.status.txt`：starting/loading_asr/loading_tts/loading_qwen/models_ready_waiting_for_board/calibrating_background/sleeping_waiting_for_wake_word/...） |
-| `network/server/start_virtual_server.cmd` | 网络化服务器（板卡经 MQTT/HTTPS/WSS 连接，替代串口） |
+| `voice_server_full/start_server_real.cmd` | 线上服务器（板卡经 MQTT/HTTPS/WSS 连接，替代串口；real 模式一键启动） |
 | 单个测试：`04_test_funasr_asr.bat`、`05_test_qwen3_http.bat`、`06_test_cosyvoice2_http.bat`、`07_test_pipeline_http.bat` | 分组件独立验证 |
 
 输出位置：
@@ -254,7 +254,7 @@ V5 两级硬件唤醒:  next_stage/voice_sleep_v5_5090/voice_daemon.py（当前�
 5. **Qwen 长回答**：system prompt 要求 100–140 字（约 20s 朗读），与 `max_new_tokens=180` 要配合调；对话历史只有 4 轮，长会话会失忆。
 6. **串口驱动**：`detect_board_port` 认 VID 0x303A；插拔后 daemon 会自己重连（V5 外层 while 循环），但自检/R 校准会重新跑一遍（约 1 分钟）。
 7. **TTf 子进程退出**：`tts_worker` 遇到合成异常会写 `response ok:false` 并继续服务，但若 CosyVoice 崩了（OOM 等），`start_tts_worker` 的 180s 等待和主进程重试逻辑要留意。
-8. **网络化版本**（`network/server/`）是另一条线：一问一答、无唤醒词状态机，靠 WSS Bearer token + 板卡设备 ID；真机联调前先用 `board_simulator.py` 验收（`变更统计.md` 第 6 节：OTA 28 项、Audio 16 项、Voice 4 项 PASS）。
+8. **线上服务器版本**（`voice_server_full/server/`）是当前主力：一问一答、无唤醒词状态机，靠 WSS Bearer token + 板卡设备 ID；真机联调前先用 `board_simulator.py` 验收（`变更统计.md` 第 6 节：OTA 28 项、Audio 16 项、Voice 4 项 PASS）。
 9. **文件队列 IPC 的落盘**：request/response 通过文件存在性轮询，`run_dir` 在 `runs/<时间戳>`，跑久了会积累大量 wav/pcm，注意磁盘回收。
 10. **性能权衡**：V5 是"省电优先"；如果要更低的对话延迟（唤醒→开口），方向是缩短 `first_tts_segment_chars`（但会牺牲韵律）、或预唤醒词缓存提示音（已做）、或把 LLM 换小模型（Qwen2.5-1.5B 在 models/ 里备着）。
 

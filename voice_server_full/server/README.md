@@ -7,7 +7,7 @@
 ## 一、目录
 
 ```
-network/server/
+voice_server_full/server/
   run_server.py            主入口(broker + HTTPS 文件 + WSS 语音 + MQTT 控制面)
   board_simulator.py       板卡模拟器(OTA/audio/voice/filedump 自动化验收)
   make_test_artifacts.py   生成测试产物(固件 bin + wav + manifest.json)
@@ -42,14 +42,14 @@ robocopy .venv\Lib\site-packages\websockets-17.0.1.dist-info .venv_vs\Lib\site-p
 ## 三、启动(自动生成产物,若缺)
 
 ```
-network\server\start_virtual_server.cmd
+..\start_server.cmd
 ```
 
 或手动:
 
 ```
-.venv_vs\Scripts\python.exe network\server\make_test_artifacts.py     # 生成固件/音频/manifest
-.venv_vs\Scripts\python.exe network\server\run_server.py              # 启动全部服务
+.venv_vs\Scripts\python.exe voice_server_full\server\make_test_artifacts.py     # 生成固件/音频/manifest
+.venv_vs\Scripts\python.exe voice_server_full\server\run_server.py              # 启动全部服务
 ```
 
 端点:
@@ -68,7 +68,7 @@ network\server\start_virtual_server.cmd
 另开终端:
 
 ```
-.venv_vs\Scripts\python.exe network\server\board_simulator.py --scenario all
+.venv_vs\Scripts\python.exe voice_server_full\server\board_simulator.py --scenario all
 ```
 
 场景:
@@ -106,7 +106,7 @@ SPKE+MIC_START);动态底噪自适应阈值(默认开)。设计书:`语音工作
 ### 启动(必须用 GPU 环境 python)
 
 ```
-.venv_5090_llm\Scripts\python.exe network\server\run_server.py --voice-mode real
+.venv_5090_llm\Scripts\python.exe voice_server_full\server\run_server.py --voice-mode real
 ```
 
 或把 `config.json → voice.mode` 改为 `"real"` 后再启动。
@@ -114,7 +114,7 @@ SPKE+MIC_START);动态底噪自适应阈值(默认开)。设计书:`语音工作
 ### 验收(模拟器播放人声 → 断言下行)
 
 ```
-.venv_5090_llm\Scripts\python.exe network\server\board_simulator.py --scenario voice --expect-downlink
+.venv_5090_llm\Scripts\python.exe voice_server_full\server\board_simulator.py --scenario voice --expect-downlink
 ```
 
 ### 实测数据(2026-08-24,samples/标准女声)
