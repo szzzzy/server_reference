@@ -29,10 +29,12 @@ class MqttAdapter:
         self.client = None
         self._ready = asyncio.Event()
         self._stop = asyncio.Event()
+        self._loop = None          # 主事件循环(引擎线程等跨线程发布须经其调度)
 
     # ---------------- 生命周期 ----------------
 
     async def start(self):
+        self._loop = asyncio.get_running_loop()   # 记住主 loop,供跨线程(引擎)发布
         m = self.cfg.get("mqtt", {})
         host = m.get("host", "127.0.0.1")
         port = int(m.get("port", 1883))
@@ -182,11 +184,16 @@ class MqttAdapter:
             log.warning("MQTT 未就绪,丢弃发布: %s", topic)
             return
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
-        if loop is not None and loop.is_running():
+        if loop is not None and self._loop is not None and loop is self._loop:
+            # 调用方就在主事件循环线程(如 admin vcmd)
             asyncio.ensure_future(self.client.publish(topic, payload_b, qos=qos))
+        elif self._loop is not None and self._loop.is_running():
+            # 跨线程发布(如 real_engine 线程):经主 loop 线程安全调度
+            asyncio.run_coroutine_threadsafe(
+                self.client.publish(topic, payload_b, qos=qos), self._loop)
         else:
             log.warning("无运行中事件循环,发布取消: %s", topic)
 

@@ -11,9 +11,10 @@
   下行: _stream_tts_segment 轮询 chunk_*.pcm → SPKS <rate> + PCM(≤1200B/帧,≈1.14×实时节奏)
         + SPKE,经 set_sink 注册的回调广播到所有在线 WSS 客户端(线程安全调度)。
 
-会话形态(2026-08-31,新版链路):
+会话形态(2026-09-02 修正):
   - 待机态: 服务器流式 ASR 判定唤醒词"你好小科"(同音容错,600ms 块级),命中→应答→MIC_START;
-  - 唤醒态: 唤醒一次·持续对话 —— 每轮 SPKE 后自动 MIC_START 续听,空闲 60s 超时回待机;
+  - 唤醒态: 唤醒一次·持续对话 —— 每轮 SPKE 后自动 MIC_START 续听,空闲 600s 超时回待机;
+  - 断联即回待机: 设备断开(掉 WiFi/重启/正常关闭)立即终止会话 —— 重连后必须重新说唤醒词;
   - 播放期: 半双工(不回采回声)+ 语义回放免疫打断(识别内容≠播放文本 → 提前 SPKE+MIC_START);
   - 动态底噪: 双窗估计器自适应阈值(默认开),启用时跳过开机静态校准。
 运行要求: 本模块与整个 run_server 需用 .venv_5090_llm 的 Python(有 torch/transformers/funasr)。
@@ -186,6 +187,7 @@ class RealVoiceEngine:
         self.cfg = cfg
         self.run_dir = Path(run_dir)
         self.project_root = Path(project_root_desc)
+        self.mqtt = None        # 由 run_server 注入(MqttAdapter);意图语义结果经其发 vcmd topic
         self.r = cfg.get("voice", {})
         self.real_cfg = self.r.get("real", {})
         self.stream = RingBuffer()
@@ -229,6 +231,11 @@ class RealVoiceEngine:
         self._first_spks_at = None          # 本轮首块音频下发的时刻(端点→首块计时用)
         self._turn_first_frame_at = None    # 本轮第一帧到达时刻(完整链路计时起点)
         self._history = []                  # 多轮对话历史[{user},{assistant}...],按 history_turns 截取
+        # ---- 线上唤醒态(在 __init__ 初始化,on_client_connected/disconnected 可能先于
+        #      _load_and_answer_loop 到达;该循环内也有一次同名初始化,语义一致) ----
+        self._awake = False                 # True=唤醒态(可续听问答);False=待机(等唤醒词)
+        self._awake_at = 0.0                # 最后一次交互时刻(空闲超时判定用)
+        self._online = False                # 是否有 WSS 设备在线(断联立即回待机)
 
     # ---------------- 引擎接口(与 stub 一致)----------------
 
@@ -274,6 +281,44 @@ class RealVoiceEngine:
             self.bad_frames += 1
         log.warning("WSS 非法 PCM1 帧: %s", reason)
 
+    def on_client_connected(self, ip=""):
+        """WSS 设备接入:新连接一律从待机态开始(必须先说唤醒词)。
+
+        覆盖"旧连接尚未被服务器发现断开(如 TCP 半开,ping 超时最迟 ~90s)设备已重连"
+        的窗口,保证任何新接入的设备都从待机开始 —— 会话状态跟连接走,不沿用旧会话。
+        """
+        with self.lock:
+            self._online = True
+            self._awake = False
+            self._awake_at = 0.0
+            # 新会话:清掉上一会话残留的历史(重连后首段不能被旧数据污染)
+            self._history = []
+        self._remember(f"CONNECT {ip or '?'} (回待机)")
+        self.stream.reset_input_buffer()
+        self._real_bytes_consumed = self.stream.real_bytes_total
+        log.info("WSS 设备接入(%s): 会话从待机开始,需说唤醒词", ip)
+
+    def on_client_disconnected(self, ip=""):
+        """WSS 设备断开(掉 WiFi/重启/正常关闭):立即终止本会话回待机。
+
+        设计文档 §1"WSS 断链/设备断开 → 服务器终止本会话任务,清 RingBuffer 与 LLM
+        history":断联后即使重新接入,也必须重新说唤醒词,不再沿用断开前的唤醒态。
+        注意: 在 WSS 事件循环线程调用,只做非阻塞操作(判别线程只置停止标志,不 join)。
+        """
+        with self.lock:
+            self._online = False
+            self._awake = False
+            self._awake_at = 0.0
+            self._history = []
+        self._remember(f"DISCONNECT {ip or '?'} (回待机)")
+        # 播放期抢话判别线程:只置停止标志,线程在下次读帧时自行退出(不 join 阻塞事件循环)
+        if self._detector is not None:
+            self._detector.stop()
+        # 清掉断开前残留的上行字节(含合成静音帧),避免重连后首段被旧数据污染
+        self.stream.reset_input_buffer()
+        self._real_bytes_consumed = self.stream.real_bytes_total
+        log.info("WSS 设备断开(%s): 会话终止回待机,重连后需重新唤醒", ip)
+
     def snapshot(self):
         """状态页数据:上行统计 + 引擎状态 + 最近 4 条识别/回答 + 最近一轮指标。"""
         with self.lock:
@@ -285,6 +330,8 @@ class RealVoiceEngine:
                 "seq_gaps": self.seq_gaps,
                 "bad_frames": self.bad_frames,
                 "buffered_bytes": self.stream.buffered_bytes,
+                "online": self._online,
+                "awake": self._awake,
                 "commands_seen": self.commands[-10:],
                 "last_texts": self.last_texts[-4:],
                 "last_result": self.last_result,
@@ -331,7 +378,7 @@ class RealVoiceEngine:
         此后所有模型常驻显存,循环里只做推理,不再重载。
 
         主循环流程(while not stop;新版固件 WSS 认证后持续上传 PCM1):
-          - 空闲超时检查(唤醒态 60s 无活动 → 回待机);
+          - 空闲超时检查(唤醒态 600s 无活动 → 回待机);
           - 待机态(voice.real.wake.enabled 且未唤醒): 唤醒参数 VAD 判一段 → 仅"判了起始"
             的段做流式 ASR + finish 冲刷(600ms 块级,命中 early-stop)→ 同音容错匹配
             "你好小科" → 命中: TTS 应答("我在，请讲。") → 丢弃应答期上行(回声) →
@@ -360,6 +407,7 @@ class RealVoiceEngine:
             rms_dbfs, save_wav,
         )
         from realtime_pipeline import resolve, start_tts_worker, tts_request
+        from intent import decide_intent
 
         models = self.real_cfg.get("models", {})
         tts_base = self._load_base_tts_config()
@@ -433,7 +481,7 @@ class RealVoiceEngine:
             self._wake_needles |= _wake_variants(_normalize_wake(_w))
         self._wake_prompt = str(wk_cfg.get("prompt", "我在，请讲。") or "")
         # 唤醒一次·持续对话: 唤醒后不回待机,仅空闲超时(无"判了起始"的段)才回待机
-        wk_timeout_s = float(wk_cfg.get("timeout_seconds", 60.0) or 0.0)
+        wk_timeout_s = float(wk_cfg.get("timeout_seconds", 600.0) or 0.0)
         # 待机判定参数(唤醒词判定要"灵敏":起声 20ms/窗口 500ms、门限默认 3dB ——
         # 唤醒只探测"有人说话",宁可多判候选 ASR 也不能漏掉唤醒词;
         # 唤醒后的对话态由 voice.real.vad 控制(默认 5dB/120ms,严格) —— 见 config)
@@ -448,6 +496,16 @@ class RealVoiceEngine:
         if self._wake_enabled:
             log.info("线上唤醒: 启用 (词=%s 应答=%r 空闲超时=%.0fs)",
                      self._wake_words, self._wake_prompt, wk_timeout_s)
+        # ---- 意图决策层 v1(规则):睡眠/拒绝/不插话短路 + 共情标记注入,见 engine/intent.py ----
+        it_cfg = self.real_cfg.get("intent")
+        it_cfg = it_cfg if isinstance(it_cfg, dict) else {}
+        self._intent_enabled = bool(it_cfg.get("enabled", False))
+        self._intent_cfg = it_cfg
+        self._noreply_tolerance = int(it_cfg.get("no_reply_tolerance_rounds", 3))
+        self._noreply_streak = 0        # 连续敷衍轮计数("没观点表达也说嗯嗯": 可容忍多轮不结束)
+        if self._intent_enabled:
+            log.info("意图层: 启用 (sleep_ack=%r decline_ack=%r)",
+                     it_cfg.get("sleep_ack", ""), it_cfg.get("decline_ack", ""))
         # 语音流停止后,在端点静音窗口内自动补静音帧,让现有 VAD 端点逻辑生效
         self.stream.enable_auto_silence(endpoint_ms / 1000.0 + 0.4)
 
@@ -467,7 +525,7 @@ class RealVoiceEngine:
                 self._real_bytes_consumed = self.stream.real_bytes_total
                 self._short_sleep(0.1)
                 continue
-            # ---- 唤醒态空闲超时(唯一退出条件): 持续对话时 60s 无活动段 → 回待机等下次唤醒词。
+            # ---- 唤醒态空闲超时(唯一退出条件): 持续对话时 600s 无活动段 → 回待机等下次唤醒词。
             #     放在最外层(等字节之前):即使设备停传/无新字节也要计时;不发任何下行命令
             #     (设备侧 LISTEN/IDLE 由固件 5 分钟远场待机自愈,PCM 不受影响)。
             if (self._wake_enabled and self._awake and wk_timeout_s > 0
@@ -553,8 +611,15 @@ class RealVoiceEngine:
                     self._real_bytes_consumed = self.stream.real_bytes_total
                     self._push_text("MIC_START")
                     print("[下行] MIC_START(线上唤醒→LISTEN)", flush=True)
-                    self._awake = True
-                    self._awake_at = time.monotonic()     # 持续对话: 最后交互时刻
+                    # 应答播放(约 1~2s)期间设备可能已断联:断联回调会把 _online/_awake
+                    # 置 False,这里在锁内复核,避免把"断联后"的过期命中重新置为唤醒态
+                    with self.lock:
+                        if self._online:
+                            self._awake = True
+                            self._awake_at = time.monotonic()   # 持续对话: 最后交互时刻
+                            self._noreply_streak = 0            # 新会话: 敷衍计数清零
+                        else:
+                            log.info("唤醒命中但设备已断联 → 不回唤醒态(等重连重新唤醒)")
                 else:
                     print("[唤醒] 未命中 → 继续待机", flush=True)
                 continue
@@ -644,24 +709,81 @@ class RealVoiceEngine:
                 # 空识别(或无有效语音):不做任何语义内容,但按协议完成收尾,
                 # 避免设备停在 THINKING —— "空播报":SPKS → 0.12s 静音 PCM → SPKE,
                 # 多轮模式下再发 MIC_START 进入下一轮(设备即将收到的只是"无声的一轮")。
-                print("[识别] 空文本 → 空播报收尾(SPKS+静音+SPKE)", flush=True)
-                self._push_text("SPKS 24000")
-                silence = b"\x00\x00" * 2880          # 2880 样本 = 0.12s @24kHz, 偶数字节
-                for off in range(0, len(silence), 1200):
-                    self._push_pcm(silence[off:off + 1200])
-                self._push_text("SPKE")
-                print("[下行] SPKE(空播报结束)", flush=True)
-                self._playback_end(0.3)   # 半双工: 零声播报后短暂不听
-                # 在线唤醒·持续对话:空轮后同样续听(不回待机);非唤醒模式按 mic_restart 决定
-                if self._wake_enabled or self.r.get("mic_restart_after_answer", False):
-                    self._push_text("MIC_START")
-                    print("[下行] MIC_START(空轮后继续下一轮)", flush=True)
+                self._send_empty_round(
+                    mic_start=bool(self._wake_enabled
+                                   or self.r.get("mic_restart_after_answer", False)))
                 if self._turn_first_frame_at is not None:
                     print(f"[链路] 第{turn}问(空轮): 首帧→收尾 "
                           f"{time.monotonic() - self._turn_first_frame_at:.2f}s", flush=True)
                 self._turn_first_frame_at = None
                 self.stream.reset_input_buffer()
                 continue
+
+            # ---- 意图决策层 v1(规则):睡眠/拒绝 → 收尾回话+结束会话;不插话 → 空播报续听;
+            #      共情 → 动态注入提示词(主提示词保持纯净) ----
+            decision = {"intent": "question", "matched": "", "inject": ""}
+            if self._intent_enabled:
+                dec = decide_intent(recognized, self._intent_cfg)
+                intent = dec["intent"]
+                if intent in ("sleep", "decline"):
+                    ack_key = "sleep_ack" if intent == "sleep" else "decline_ack"
+                    ack = str(self._intent_cfg.get(ack_key) or "")
+                    print(f"[意图] {intent} 命中({dec['matched']!r}): {recognized[:32]!r}", flush=True)
+                    self._remember(f"{intent.upper()} {recognized}")
+                    # ① 固件语义结果: 仅对有状态语义的意图发送(sleep→goodnight / decline→dismiss,
+                    #    配置 intent_result 映射;对话类意图不发——固件默认路径即续听)
+                    self._publish_intent_result(intent)
+                    if ack:
+                        got = self._speak_prompt(ack, tts_base, queue, tts_dir,
+                                                 tag=f"{intent}_{int(time.time())}")
+                        print(f"[意图] {intent} 收尾回话: {ack!r}", flush=True)
+                    else:
+                        # 无回话配置 → 空播报收尾(协议兜底,设备绝不卡 THINKING)
+                        self._send_empty_round(mic_start=False)
+                    # ② 结束会话: 回待机,需重新说唤醒词
+                    self._awake = False
+                    self._awake_at = 0.0
+                    self._noreply_streak = 0   # 会话级计数: 结束即清零(下次唤醒重新累计)
+                    round_s = round(time.monotonic() - self._turn_first_frame_at, 2) \
+                        if self._turn_first_frame_at is not None else None
+                    self._turn_first_frame_at = None
+                    self.stream.reset_input_buffer()
+                    print(f"[意图] {intent} → 结束会话回待机(等下次唤醒词)"
+                          + (f" · 首帧→收尾 {round_s}s" if round_s is not None else ""),
+                          flush=True)
+                    continue
+                if intent == "no_reply":
+                    self._noreply_streak += 1
+                    print(f"[意图] no_reply 命中({dec['matched']!r}) 连续{self._noreply_streak}"
+                          f"/{self._noreply_tolerance}轮 → 空播报续听", flush=True)
+                    self._remember(f"NOREPLY {recognized}")
+                    if self._noreply_streak < self._noreply_tolerance:
+                        # 敷衍容忍期: 用户"嗯嗯"可能只是没观点要表达 → 空播报 + 续听(normal)
+                        self._publish_intent_result("normal")
+                        self._send_empty_round(mic_start=True)
+                        round_s = round(time.monotonic() - self._turn_first_frame_at, 2) \
+                            if self._turn_first_frame_at is not None else None
+                        self._turn_first_frame_at = None
+                        self.stream.reset_input_buffer()
+                        print(f"[意图] no_reply 首帧→收尾 {round_s}s" if round_s is not None
+                              else "[意图] no_reply 收尾完成", flush=True)
+                        continue
+                    # 超过容忍轮次(≥3轮连续敷衍) → 结束会话(dismiss),不再续听
+                    print(f"[意图] no_reply 连续{self._noreply_streak}轮 ≥ {self._noreply_tolerance}"
+                          f" → 结束会话(dismiss)", flush=True)
+                    self._publish_intent_result("dismiss")
+                    self._send_empty_round(mic_start=False)
+                    self._awake = False
+                    self._awake_at = 0.0
+                    self._noreply_streak = 0   # 会话级计数: 结束即清零
+                    self._turn_first_frame_at = None
+                    self.stream.reset_input_buffer()
+                    print("[意图] no_reply 超限 → 回待机(等下次唤醒词)", flush=True)
+                    continue
+                # question(共情功能已移除,负面情绪归此): 正常问答 + 常驻状态 normal
+                self._noreply_streak = 0
+                print("[意图] question → 正常问答", flush=True)
+                self._publish_intent_result("normal")
 
             self._endpoint_wall = t_endpoint      # 供 TTS 首块计时
             self._first_spks_at = None
@@ -671,7 +793,7 @@ class RealVoiceEngine:
                     sentence_chunks=self._sentence_chunks, queue=queue, tts_dir=tts_dir,
                     tts_base=tts_base, result_csv=result_csv,
                     asr_seconds=asr_seconds, input_wav=str(input_wav),
-                    endpoint_wall=t_endpoint,
+                    endpoint_wall=t_endpoint, llm_inject=decision.get("inject", ""),
                 )
                 self.last_result = answered
             except Exception:
@@ -815,7 +937,7 @@ class RealVoiceEngine:
 
     def _answer_qa(self, turn, user_text, tokenizer, llm, streamer_cls,
                    sentence_chunks, queue, tts_dir, tts_base, result_csv,
-                   asr_seconds, input_wav, endpoint_wall):
+                   asr_seconds, input_wav, endpoint_wall, llm_inject=""):
         """一轮"问—答(LLM)—切句—合成—下行"的完整编排(LLM 模块核心)。
 
         线程编排(一次问答同时有 3 个执行体):
@@ -847,6 +969,9 @@ class RealVoiceEngine:
         messages = []
         system_prompt = str(conversation.get("system_prompt")
                             or self.real_cfg.get("system_prompt") or "").strip()
+        # 意图层动态注入(共情等):临时附加到 system 提示,不污染基础提示词
+        if llm_inject and llm_inject.strip():
+            system_prompt = (system_prompt + " " + llm_inject).strip()
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         # 多轮上下文:取最近 history_turns 轮(每轮 = user + assistant 两条)。
@@ -987,9 +1112,11 @@ class RealVoiceEngine:
 
         response = "".join(response_pieces).strip()
         self._remember(f"A{turn}: {response[:80]}")
-        # 多轮历史入库(供下一轮 context)
-        self._history.append({"role": "user", "content": user_text})
-        self._history.append({"role": "assistant", "content": response})
+        # 多轮历史入库(供下一轮 context);断联后会话已终止(历史被清),
+        # 旧轮次不再写入新会话 —— 避免重连后上下文残留上一会话内容
+        if self._online:
+            self._history.append({"role": "user", "content": user_text})
+            self._history.append({"role": "assistant", "content": response})
         total_sec = round(time.perf_counter() - started, 3)
         print(f"[计时] 第{turn}问: 端点→播完全部回答 {total_sec:.1f}s (LLM+合成 {seg_index} 段, 首字 {first_token_seconds}s, "
               f"首块音频 {tts_wall}s)", flush=True)
@@ -1028,6 +1155,45 @@ class RealVoiceEngine:
             d.stop()
             d.join(timeout=1.0)
         self._playback_until = time.monotonic() + safety_s
+
+    def _publish_intent_result(self, intent):
+        """固件侧语义契约(2026-09-01 约定):仅对有状态语义的意图发 MQTT JSON 到 vcmd topic。
+
+        配置 voice.real.intent.intent_result = {意图: 消息值};空字符串/未配置 = 不发送。
+          {"type":"intent_result","intent":"goodnight"}  → 用户说晚安,固件切睡眠状态
+          {"type":"intent_result","intent":"dismiss"}    → 用户结束对话,固件退出对话
+        纯文本命令保持兼容;其余固件状态收到会忽略。发布失败仅告警,不影响语音链路。
+        """
+        if self.mqtt is None:
+            return
+        rules = self._intent_cfg.get("intent_result")
+        rules = rules if isinstance(rules, dict) else {}
+        value = str(rules.get(intent, "") or "")
+        if not value:
+            return
+        payload = json.dumps({"type": "intent_result", "intent": value}, ensure_ascii=False)
+        try:
+            self.mqtt.send_vcmd(payload)
+            log.info("MQTT -> vcmd: %s", payload)
+        except Exception as exc:
+            log.warning("意图结果 MQTT 发布失败(%s): %r", intent, exc)
+
+    def _send_empty_round(self, mic_start=True):
+        """空播报收尾:SPKS → 0.12s 静音 PCM → SPKE(设备 THINKING→IDLE,绝不卡状态)。
+
+        mic_start=True  → 空轮后发 MIC_START 续听(不插话/正常空轮);
+        mic_start=False → 空轮后保持(结束会话路径,由调用方负责回待机)。
+        """
+        print("[下行] 空播报收尾(SPKS+静音+SPKE)", flush=True)
+        self._push_text("SPKS 24000")
+        silence = b"\x00\x00" * 2880          # 2880 样本 = 0.12s @24kHz, 偶数字节
+        for off in range(0, len(silence), 1200):
+            self._push_pcm(silence[off:off + 1200])
+        self._push_text("SPKE")
+        self._playback_end(0.3)               # 半双工: 零声播报后短暂不听
+        if mic_start:
+            self._push_text("MIC_START")
+            print("[下行] MIC_START(空轮后继续下一轮)", flush=True)
 
     def _speak_prompt(self, text, tts_base, queue, tts_dir, tag):
         """单段 TTS 播报(唤醒应答/提示语):非流式合成完整 wav → SPKS + PCM ≤1200B/帧 + SPKE。

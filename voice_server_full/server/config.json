@@ -46,7 +46,7 @@
   },
   "deps_root": "C:/Users/user/Desktop/vr_test_5090_20260819_224201",
   "conversation": {
-    "system_prompt": "你是语音助手。请用中文自然、简练地回答用户问题，回答控制在2到3个连贯短句，共约30到50个汉字，第一句尽量不超过10个字，直接回答不要铺垫。用户打招呼时，只回一句简短问候并紧接着询问用户需求，不要只回复\"你好\"。用户语音可能存在同音字误识，请结合语境理解，不要追问或纠正用词。资料不足时简短说明，不要编造。",
+    "system_prompt": "你是语音助手。请用中文自然、简练地回答用户问题，回答控制在2到3个连贯短句，共约30到50个汉字，第一句尽量不超过10个字，直接回答不要铺垫。用户打招呼时，只回一句简短问候并紧接着询问用户需求，不要只回复’你好‘。用户语音可能存在同音字误识，请结合语境理解，不要追问或纠正用词。资料不足时简短说明，不要编造。若用户明显有负面情绪（如烦、累、担心、失望等），第一句改为简短共情，以’听起来你很…‘开头、该句不超过10个字，随后照常回答；没有明显情绪时绝不共情。",
     "max_new_tokens": 60,
     "history_turns": 10
   },
@@ -91,13 +91,36 @@
         "enabled": true,
         "words": ["你好小科"],
         "prompt": "我在，请讲。",
-        "timeout_seconds": 60,
+        "timeout_seconds": 600,
         "listen_seconds": 8.0,
         "endpoint_silence_ms": 500,
         "start_above_db": 3.0,
         "end_above_db": 3.0,
         "start_active_ms": 20,
         "start_window_ms": 500
+      },
+      "intent": {
+        "enabled": true,
+        "intent_result": {
+          "normal": "normal",
+          "sleep": "goodnight",
+          "decline": "dismiss",
+          "dismiss": "dismiss"
+        },
+        "no_reply_tolerance_rounds": 3,
+        "sleep_ack": "晚安，有需要随时叫我。",
+        "decline_ack": "好的，随时找我",
+        "sleep_phrases": ["我要睡了", "想睡了", "睡觉了", "想睡觉", "困了", "好困", "太困了",
+                          "睡吧", "洗洗睡了", "关灯睡了", "先睡了"],
+        "sleep_standalone": ["晚安", "晚安了", "说晚安"],
+        "decline_phrases": ["不想聊了", "不想说了", "不聊了", "不想再聊了", "就这样吧", "就这样了",
+                            "别再问了", "别说了", "不用了", "算了", "挂了吧", "结束对话", "不说了"],
+        "decline_suffix": ["再见", "拜拜", "再见了", "拜拜了", "走了"],
+        "no_reply_words": ["嗯嗯", "嗯", "好", "好的", "行", "哦", "哦哦", "收到", "明白",
+                           "知道了", "嗯好", "好呀"],
+        "gate_chars": 12,
+        "suffix_gate_chars": 12,
+        "no_reply_gate_chars": 4
       },
       "vad": {
         "background_dbfs": -60,

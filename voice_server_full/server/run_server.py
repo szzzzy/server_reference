@@ -106,6 +106,9 @@ async def amain(args, cfg, run_dir):
         mqtt = MqttAdapter(cfg, hub, store, run_dir)
         mqtt.on_vcmd = on_vcmd_cb
         await mqtt.start()
+        # 引擎挂上 MQTT 发布通道(意图语义结果 intent_result 走 vcmd topic,见 real_engine)
+        if engine is not None:
+            engine.mqtt = mqtt
 
     # ---------- 5) 管理通道:stdin 控制台 + 一次性 vcmd ----------
     async def console():
