@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0"
 echo ==========================================================
-echo  VR Voice Server (network) - STUB mode, no models loaded
+echo  VR Voice Server - STUB mode, no models loaded
 echo  WSS :9443/voice   HTTPS :8443   MQTT disabled
 echo ==========================================================
 set "PY=%VSF_STUB_PY%"

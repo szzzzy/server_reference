@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0"
 echo ==========================================================
-echo  VR Voice Server (network) - REAL mode, ASR + Qwen3 + TTS
+echo  VR Voice Server - REAL mode, ASR + Qwen3 + TTS
 echo  WSS :9443/voice   HTTPS :8443   MQTT disabled
 echo ==========================================================
 set "PY=%VSF_REAL_PY%"
