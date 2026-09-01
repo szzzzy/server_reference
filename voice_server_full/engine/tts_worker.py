@@ -106,13 +106,26 @@ def main():
     queue.mkdir(parents=True, exist_ok=True)
     model = CosyVoice2(args.model_dir, load_jit=False, load_trt=False,
                        load_vllm=False, fp16=True)
+    # ---- 前端特征缓存(参考音频不变):零样本合成的 prompt 特征(campplus 说话人嵌入
+    # / speech_tokenizer_v2 的参考音频 token/参考 mel)每次请求都经 ONNX-CPU 重算,
+    # 实测 ~0.24s/请求(首块 2.13s→1.90s,多段回答每段再省一次)。
+    # 官方机制:add_zero_shot_spk → spk2info 缓存;带 zero_shot_spk_id 的
+    # frontend_zero_shot 直接取缓存(third_party/CosyVoice/.../frontend.py L185)。
+    SPK_ID = "main"
+    try:
+        model.add_zero_shot_spk(args.prompt_text, args.prompt_wav, SPK_ID)
+        print("[spk-cache] 参考音频特征已缓存(add_zero_shot_spk)", flush=True)
+    except Exception as cache_exc:
+        SPK_ID = ""
+        print(f"[spk-cache] 参考音频缓存失败,回退逐请求计算: {cache_exc}", flush=True)
     # ---- 预热(降延迟关键):正式合成前先跑一次短句,把"每段首块"的固定开销
     # (流式解码/图优化/显存分配等)在就绪阶段消化掉。
     # 预热前首块 rtf≈2.0(合成 0.9s 音频要 ~1.9s);预热后同段后续块 rtf≈0.6,
     # 首块延迟可降 1s 以上 —— 直接决定"端点→第一声"。
     try:
         for _warm in model.inference_zero_shot(
-                "你好。", args.prompt_text, args.prompt_wav, stream=True):
+                "你好。", args.prompt_text, args.prompt_wav, stream=True,
+                zero_shot_spk_id=SPK_ID):
             pass
         print("[warmup] TTS 预热完成", flush=True)
     except Exception as _wexc:
@@ -139,7 +152,8 @@ def main():
                 stream_dir.mkdir(parents=True, exist_ok=True)
             chunk_index = 0
             for result in model.inference_zero_shot(
-                request["text"], args.prompt_text, args.prompt_wav, stream=True
+                request["text"], args.prompt_text, args.prompt_wav, stream=True,
+                zero_shot_spk_id=SPK_ID
             ):
                 if first_audio is None:
                     first_audio = time.perf_counter() - started
