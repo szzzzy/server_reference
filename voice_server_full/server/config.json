@@ -159,7 +159,7 @@
           "min_duration_s": 8.0,
           "active_ratio": 0.9,
           "max_chars": 4,
-          "no_reply_max_duration_s": 2.0
+          "no_reply_max_duration_s": 0
         },
         "speech_detector": {
           "enabled": true,

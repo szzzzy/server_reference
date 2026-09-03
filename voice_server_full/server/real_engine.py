@@ -1010,16 +1010,20 @@ class RealVoiceEngine:
             if self._intent_enabled:
                 dec = decide_intent(recognized, self._intent_cfg)
                 intent = dec["intent"]
-                # 长段"敷衍词"防护: 段长 ≥ no_reply_max_duration_s(默认2s) 时,≤4 字的
-                # no_reply 不可能是敷衍(如 9.64s 噪声/长句被误识别成"嗯嗯")→ 按正常问答
-                # 处理(不进敷衍计数,防"噪声 3 段误结束会话")
+                # 长段"敷衍词"防护(默认关闭:no_reply_max_duration_s=0):段长 ≥ 阈值时,≤4 字
+                # 的 no_reply 不可能是敷衍(如 9.64s 噪声/长句被误识别成"嗯嗯")—— 但该防护
+                # 会误伤真实"好的/嗯嗯": 环境噪声下 VAD 活跃窗被拉长,段长经常 ≥2s(实测
+                # 2.8~15s),真实敷衍全部被转 question 且清零计数 → 连续确认永不触发
+                # (20260903 运行"三轮好的全部正常应答"的根因)。原始目标(9.64s 噪声段误当
+                # 敷衍)已由更前置的两层兜底: ① fsmn-vad 非语音段拦截(不进轮)② noise_gate
+                # (≥min_duration_s 且占比≥0.9 且≤4字 → 判噪声丢文本),故仅显式配置 >0 时启用。
                 ng = self.real_cfg.get("vad", {}).get("noise_gate") or {}
-                if (intent == "no_reply"
-                        and (len(samples) / 16000.0) >= float(
-                            ng.get("no_reply_max_duration_s", 2.0) if isinstance(ng, dict)
-                            else 2.0)):
-                    print(f"[意图] no_reply 但段长 {len(samples)/16000.0:.1f}s ≥ 2s → 按 question 处理",
-                          flush=True)
+                max_dur = float(ng.get("no_reply_max_duration_s", 0.0) if isinstance(ng, dict)
+                                else 0.0)
+                if (max_dur > 0 and intent == "no_reply"
+                        and (len(samples) / 16000.0) >= max_dur):
+                    print(f"[意图] no_reply 但段长 {len(samples)/16000.0:.1f}s ≥ {max_dur:.0f}s"
+                          + " → 按 question 处理", flush=True)
                     intent = "question"
                 if intent in ("sleep", "decline"):
                     print(f"[意图] {intent} 命中({dec['matched']!r}): {recognized[:32]!r}", flush=True)
