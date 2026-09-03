@@ -129,6 +129,7 @@
       "vad": {
         "background_dbfs": -60,
         "background_seconds": 2.5,
+        "empty_round_cooldown_s": 1.0,
         "start_above_db": 5.0,
         "end_above_db": 3.0,
         "start_active_ms": 120,

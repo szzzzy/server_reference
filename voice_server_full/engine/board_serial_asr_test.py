@@ -141,6 +141,28 @@ class NoiseFloorTracker:
         self._rise_pending = 0
         self._traj.clear()
 
+    def feed_segment(self, dbfs_list, now=None):
+        """整段回填(2026-09-03):把已知**无语音段**(空解析/噪声判决)的逐帧电平直接喂入。
+
+        用途:键盘/瞬态噪声场景 —— 噪声 120ms 内即触发 speech_started,逐帧路径被冻结,
+        fast 窗永远不足 fast_min_frames(20)帧 → bg 停在初值不动,"阈值=bg+offset"退化为
+        固定绝对阈值,恰好卡在键盘噪声中位(-53~-54dBFS)→ 每次敲击必触发一轮空轮。
+        本方法绕过冻结:按段时间轴(20ms/帧,终点=now)注入帧,估计器自身逻辑
+        (≤-100 合成静音帧忽略 / fast·slow 窗 / 上升确认+限速 / 钳制)全部沿用,
+        无新阈值语义;有文本的人声段不进本方法(含人声成分,会污染估计器)。
+        """
+        now = time.monotonic() if now is None else float(now)
+        n = len(dbfs_list)
+        t0 = now - n * 0.02
+        for i, d in enumerate(dbfs_list):
+            self.on_frame(float(d), False, ts=t0 + i * 0.02)
+        # 补两拍更新: on_frame 的 0.5s 更新边界与"上一段最后更新时间"的关系不确定,
+        # 段末帧时间戳可能整段都跨不过边界(实测 12.5s 段 0 次更新,浮点擦边)——
+        # 补拍保证每段至少完成"连续 2 次确认"的上升判定;每次步长仍被
+        # up_max_db_per_s×update_interval(1.5dB)钳制,不会单段暴跳。
+        self._update(now)
+        self._update(now)
+
     def bg(self):
         """当前底噪估计(dBFS);VAD 每帧阈值 = bg() + offset。"""
         return self._bg

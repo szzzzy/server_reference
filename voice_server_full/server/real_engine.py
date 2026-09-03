@@ -294,6 +294,7 @@ class RealVoiceEngine:
         self._online = False                # 是否有 WSS 设备在线(断联立即回待机)
         self._noreply_streak = 0            # 连续敷衍疑似计数(会话级;前N-1次仅计数按正常对话,
                                             # 第N次确认dismiss;断联/重唤醒清零)
+        self._empty_cooldown_at = None      # 空解析/噪声轮后的冷却截止时刻(防键盘/瞬态噪声连发)
 
     # ---------------- 引擎接口(与 stub 一致)----------------
 
@@ -544,6 +545,8 @@ class RealVoiceEngine:
         default_background = float(vad.get("background_dbfs", -60))
         background_seconds = float(
             vc.get("background_seconds", vad.get("background_seconds", 2.5)))
+        # 空解析轮冷却秒数: 无文本轮(键盘/瞬态噪声)后不立即进新一轮,防 6 连空轮类连发
+        empty_round_cooldown_s = float(vad.get("empty_round_cooldown_s", 1.0))
         # ---- 动态底噪:双窗估计器(默认关闭;enabled=false 时 _floor=None,完全走原路径) ----
         df_cfg = vad.get("dynamic_floor")
         df_cfg = df_cfg if isinstance(df_cfg, dict) else {}
@@ -813,6 +816,18 @@ class RealVoiceEngine:
                     self._send_mic_start("语音起始")
                     print("[下行] MIC_START(检测到本轮语音起始,设备→LISTEN)", flush=True)
 
+            # ---- 空轮冷却(2026-09-03): 空解析/噪声轮后 ≤empty_round_cooldown_s(默认1s)
+            #      内不启动新一轮 —— 键盘/瞬态噪声连续触发(实测 6 连空轮 + ERROR
+            #      playback_state)。冷却期上行仍缓冲在 RingBuffer(512KB≈16s,不断流),
+            #      真实人声不丢,仅延迟新一轮检测;与"空段回填底噪"配合: 触发率压到
+            #      ≤1 次/秒,同时 bg 每轮 +3dB 上移,几轮内阈值抬到噪声之上 → 键盘不再触发。
+            if (self._empty_cooldown_at is not None
+                    and time.monotonic() < self._empty_cooldown_at):
+                wait = self._empty_cooldown_at - time.monotonic()
+                print(f"[空轮冷却] 等待 {wait:.1f}s 再进新一轮(防噪声连发)", flush=True)
+                self._short_sleep(wait)
+                self._empty_cooldown_at = None
+
             try:
                 samples, _, endpoint = capture_until_endpoint(
                     self.stream, max_seconds=max_seconds,
@@ -908,8 +923,8 @@ class RealVoiceEngine:
             # 计算为本地 numpy 统计(<1ms),不增加链路时延;ASR 流式早已并行出字。
             is_noise, active_ratio = self._judge_noise_segment(
                 samples, endpoint, recognized, background_dbfs)
-            if self._wake_enabled and not is_noise:
-                self._awake_at = time.monotonic()          # 噪声段不算交互
+            if self._wake_enabled and not is_noise and recognized:
+                self._awake_at = time.monotonic()   # 噪声段/空解析轮不算交互(防噪声"续命"600s)
             if is_noise and self._floor is not None:
                 th = float(endpoint.get("vad_threshold_dbfs") or background_dbfs)
                 n = len(samples) // 320
@@ -934,6 +949,23 @@ class RealVoiceEngine:
                     save_wav(audio_dir / f"noise_{turn:03d}_{int(time.time())}.wav", samples)
                 except Exception:
                     pass
+            # ---- 空解析段回填底噪(2026-09-03): 无文本段(键盘/瞬态噪声触发但 ASR 空)----
+            # 估计器只在预语音段(speech_started=False)收帧,噪声 120ms 内即触发起点 →
+            # bg 永远停在初值(实测全程 -60dBFS),固定阈值正卡在键盘噪声中位(-53~-54dBFS)
+            # → 每次敲击都进一轮空轮。无文本段不含人声成分:整段真实帧按段时间轴喂入
+            # 估计器(feed_segment: 合成静音帧≤-100 自动忽略/上升确认+3dB/s 限速/钳制
+            # 全沿用,无新阈值语义),几轮内收敛到噪声地板 → 阈值自适应抬到噪声之上,
+            # 键盘不再触发;安静后由 slow 窗 0.5dB/s 慢降回灵敏。
+            if (not is_noise and not recognized and self._floor is not None
+                    and len(samples) >= 6400):
+                n = len(samples) // 320
+                rows = np.array(samples[:n * 320], dtype=np.int16).reshape(-1, 320)
+                prev_bg = self._floor.bg()
+                self._floor.feed_segment([rms_dbfs(row) for row in rows])
+                if self._floor.bg() > prev_bg + 0.5:
+                    log.warning("空解析段回填底噪: 段%.1fs → bg_t %.1f→%.1fdB"
+                                "(阈值随环境上移,后续噪声不再触发)",
+                                len(samples) / 16000, prev_bg, self._floor.bg())
             # ---- 观测: 全部轮次落盘(判决/调参依据,噪声与空轮此前无记录) ----
             self._append_row(self.run_dir / "voice_rounds_log.csv", {
                 "time": datetime.now().isoformat(timespec="seconds"),
@@ -961,6 +993,11 @@ class RealVoiceEngine:
                           f"{time.monotonic() - self._turn_first_frame_at:.2f}s", flush=True)
                 self._turn_first_frame_at = None
                 self.stream.reset_input_buffer()
+                # 空轮冷却: 键盘/瞬态噪声连发时,空解析轮后隔一段时间再进新一轮
+                self._empty_cooldown_at = time.monotonic() + empty_round_cooldown_s
+                if empty_round_cooldown_s > 0:
+                    print(f"[空轮冷却] 空解析轮 → {empty_round_cooldown_s:.1f}s 后再进新一轮",
+                          flush=True)
                 continue
 
             # ---- 意图决策层 v1(规则):睡眠/拒绝 → 收尾回话+结束会话(需重新唤醒);
