@@ -8,8 +8,8 @@
     "path": "/voice",
     "token": "julia-test-token-2026",
     "tls": true,
-    "ping_interval": 60,
-    "ping_timeout": 30
+    "ping_interval": 10,
+    "ping_timeout": 20
   },
   "file_server": {
     "host": "0.0.0.0",
@@ -72,6 +72,7 @@
     "mode": "stub",
     "downlink_rate": 24000,
     "mic_restart_after_answer": true,
+    "mic_start_min_delay_s": 0.3,
     "real": {
       "deps_root": "C:/Users/user/Desktop/vr_test_5090_20260819_224201",
       "models": {
@@ -83,7 +84,7 @@
       "history_turns": 0,
       "max_new_tokens": 80,
       "interrupt": {
-        "enabled": true,
+        "enabled": false,
         "min_chars": 2,
         "min_similarity": 0.5
       },
@@ -97,7 +98,8 @@
         "start_above_db": 3.0,
         "end_above_db": 3.0,
         "start_active_ms": 20,
-        "start_window_ms": 500
+        "start_window_ms": 500,
+        "ready_timeout_s": 2.0
       },
       "intent": {
         "enabled": true,
@@ -114,7 +116,9 @@
                           "睡吧", "洗洗睡了", "关灯睡了", "先睡了"],
         "sleep_standalone": ["晚安", "晚安了", "说晚安"],
         "decline_phrases": ["不想聊了", "不想说了", "不聊了", "不想再聊了", "就这样吧", "就这样了",
-                            "别再问了", "别说了", "不用了", "算了", "挂了吧", "结束对话", "不说了"],
+                            "别再问了", "别说了", "不用了", "算了", "挂了吧", "结束对话", "不说了",
+                            "别烦我", "想静静", "别打扰我", "让我静静", "我想静静", "我要静静",
+                            "别理我", "安静一点", "清静一下"],
         "decline_suffix": ["再见", "拜拜", "再见了", "拜拜了", "走了"],
         "no_reply_words": ["嗯嗯", "嗯", "好", "好的", "行", "哦", "哦哦", "收到", "明白",
                            "知道了", "嗯好", "好呀"],
@@ -148,6 +152,21 @@
           "slow_min_frames": 50,
           "floor_min_dbfs": -80.0,
           "floor_max_dbfs": -35.0
+        },
+        "noise_gate": {
+          "enabled": true,
+          "min_duration_s": 8.0,
+          "active_ratio": 0.9,
+          "max_chars": 4,
+          "no_reply_max_duration_s": 2.0
+        },
+        "speech_detector": {
+          "enabled": true,
+          "provider": "fsmn_vad",
+          "model_dir": "models/fsmn-vad/snapshots/master",
+          "device": "cpu",
+          "min_speech_ratio": 0.2,
+          "min_speech_ms": 300.0
         }
       }
     }

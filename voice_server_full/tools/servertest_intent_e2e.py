@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""意图决策层端到端测试 v2(2026-09-01 规则): 睡眠/敷衍容忍3轮/共情dismiss/拒绝。
+"""意图决策层端到端测试 v3(2026-09-03 规则): 睡眠/敷衍两级判定/拒绝。
 
 流程:
   E1 唤醒 → E2 睡眠(goodnight+回话+不续听) → E3 再唤醒
-  E4a-c 连续敷衍×3(空播报+MIC_START) → E4d 第4轮敷衍(dismiss+不续听)
-  E5 再唤醒 → E6 共情(累死了: 安抚回答播完+不续听,dismiss) → E7 再唤醒
-  E8 拒绝(回话+不续听,dismiss)
+  E4a-b 连续敷衍×2(前2轮"疑似": 记录计数,按正常对话应答)
+  E4c 第3轮敷衍(确认超限: dismiss→无表达、不续听)
+  E5 再唤醒 → E6 拒绝(回话+不续听,dismiss)
 """
 import argparse
 import asyncio
@@ -123,19 +123,23 @@ async def main():
     check("E3 睡眠后可再次唤醒", "SPKS 24000" in texts and texts[-1] == "MIC_START",
           f"seq={texts} 上传->MIC_START={el:.2f}s")
 
-    # ---- E4 连续敷衍: 容忍期=2 轮(no_reply_tolerance_rounds=3,第3轮超限) ----
+    # ---- E4 连续敷衍: 前2轮"疑似"(no_reply_tolerance_rounds=3,第3轮确认超限) ----
+    #      疑似轮: 单次"嗯嗯"无法断定敷衍 → 仅记录,按正常对话应答(SPKS→真实PCM→SPKE);
+    #      应答后不主动续听(下一轮语音起始时由服务器发 MIC_START,见 §11 编排)。
     for i in range(2):
         await upload(ws, noreply_pcm)
-        texts, pcm, el = await collect_until(ws, "MIC_START", 60.0, f"noreply_{i}")
-        check(f"E4.{i + 1} 敷衍容忍轮: 空播报+续听",
-              "SPKS 24000" in texts and "SPKE" in texts and texts[-1] == "MIC_START",
-              f"seq={texts} 上传->MIC_START={el:.2f}s")
-    # ---- E4.3 第3轮敷衍 → 超限结束会话(dismiss),不续听 ----
+        texts, pcm, el = await collect_until(ws, "SPKE", 60.0, f"noreply_{i}")
+        check(f"E4.{i + 1} 敷衍嫌疑轮: 按正常对话应答(PCM非空)",
+              "SPKS 24000" in texts and "SPKE" in texts and pcm and any(pcm),
+              f"seq={texts} pcm={len(pcm)} 上传->SPKE={el:.2f}s")
+    # ---- E4.3 第3轮敷衍 → 确认超限结束会话(dismiss): 无表达(不再 SPKS/SPKE),不续听。
+    #      MIC_START 允许出现在本轮语音起始(设备→LISTEN 协议点),dismiss 后不得再发。
     await upload(ws, noreply_pcm)
-    texts, pcm, el = await collect_until(ws, "SPKE", 60.0, "noreply_x")
+    texts, pcm, el = await collect_until(ws, "", 8.0, "noreply_x")
     texts2, _, _ = await collect_until(ws, "", 3.0, "noreply_x_after")
-    check("E4.3 敷衍第3轮: 超限结束会话(无 MIC_START)",
-          "SPKS 24000" in texts and "SPKE" in texts and "MIC_START" not in texts2,
+    check("E4.3 敷衍第3轮: 确认超限结束会话(无 SPKS/SPKE,dismiss 后无 MIC_START)",
+          "MIC_STOP" in texts and "SPKS" not in texts and "SPKE" not in texts
+          and "MIC_START" not in texts2,
           f"seq={texts} after={texts2}")
 
     # ---- E5 再唤醒 → E6 拒绝: 收尾回话 + 不续听 ----

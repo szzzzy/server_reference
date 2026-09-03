@@ -115,6 +115,7 @@ class MqttBroker:
         self.sessions = {}        # client_id -> BrokerSession
         self.server = None
         self._pids = 0
+        self.on_device_connect = None   # 可选回调(client_id, clean): 设备 MQTT 重连(重启)事件
 
     async def start(self):
         self.server = await asyncio.start_server(
@@ -157,6 +158,13 @@ class MqttBroker:
             sess.last = time.monotonic()
             await io.write_packet(CONNACK << 4, struct.pack(">BB", 0, 0))
             log.info("broker: CONNACK %s (clean=%s, keepalive=%s)", client_id, clean, keepalive)
+            # 设备(MQTT 客户端 esp*)重新 CONNECT = 设备网络栈/整机重启(旧 WSS 连接
+            # 可能在服务器侧残留) → 通知上层"设备重启,会话应重置为待机(需重新唤醒)"
+            if self.on_device_connect is not None and client_id.lower().startswith("esp"):
+                try:
+                    self.on_device_connect(client_id, clean)
+                except Exception as exc:
+                    log.warning("on_device_connect 回调失败: %s", exc)
             while True:
                 b0, payload = await io.read_packet()
                 if b0 is None:

@@ -339,6 +339,7 @@ def capture_until_endpoint(
     on_chunk=None,
     floor_tracker=None,
     stop_event=None,
+    on_start=None,
 ):
     """能量 VAD 主函数:边收帧边判定"人开始说话了吗 / 人说完了吗",输出整段语音。
 
@@ -357,6 +358,9 @@ def capture_until_endpoint(
                                     speech_started 前估计器持续更新,判定开始后本轮冻结。
       stop_event                    threading.Event(可选):置位后下一帧即提前退出(early-stop),
                                     用于"检测到目标即可不再等段尾"的场景(流式唤醒命中即时响应)。
+                                    on_start                      可调用(可选):检测到"人开始说话"(speech_started 置位)时
+                                    调用一次。用于"非唤醒说完成不主动续听、检测到下一轮合法
+                                    语音输入后再发 MIC_START"的编排。
 
     起始检测:读帧 → 帧内活跃样本计数 → 300ms 滑窗(窗口滚出则扣除) →
       活跃样本 ≥ 120ms → speech_started=True,并把 speech_start_sample 回退到窗口起点。
@@ -442,6 +446,8 @@ def capture_until_endpoint(
                 speech_start_sample = max(0, total_samples - start_activity_window_samples)
                 last_active_sample = total_samples
                 trailing_silence_samples = 0
+                if on_start is not None:
+                    on_start()
         else:
             if frame_dbfs > endpoint_threshold_dbfs:
                 last_active_sample = total_samples

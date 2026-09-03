@@ -33,6 +33,9 @@ class RangeFileHandler(BaseHTTPRequestHandler):
         if path == "/__status":
             self._status(head_only)
             return
+        if path == "/__stall":
+            self._stall(head_only)
+            return
         if path == "/__debug":
             self._debug_page(head_only)
             return
@@ -88,6 +91,35 @@ class RangeFileHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         self.end_headers()
         if body:
+            self.wfile.write(body)
+
+    def _stall(self, head_only):
+        """注压测试端点: GET /__stall?sec=<秒> → 暂停读取 WSS 上行,制造设备 TX 背压。
+        供浏览器/curl 手动触发(等价于服务器控制台输入 'wait <秒>')。"""
+        import json as _json
+        fn = getattr(self.server, "stall_fn", None)
+        sec = 5.0
+        q = self.path.partition("?")[2]
+        for kv in q.split("&"):
+            k, _, v = kv.partition("=")
+            if k == "sec":
+                try:
+                    sec = float(v)
+                except ValueError:
+                    pass
+        ok = False
+        if fn is not None:
+            try:
+                fn(sec)
+                ok = True
+            except Exception as e:
+                log.warning("__stall 调用失败: %s", e)
+        body = _json.dumps({"ok": ok, "stall_seconds": sec}, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body) if not head_only else 0))
+        self.end_headers()
+        if body and not head_only:
             self.wfile.write(body)
 
     def _status(self, head_only):

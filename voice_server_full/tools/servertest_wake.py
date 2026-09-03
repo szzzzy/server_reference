@@ -8,7 +8,7 @@
     阶段4: 再传唤醒词 → 二次唤醒应答 + MIC_START
 
 用法: 先启动 run_server.py --voice-mode real(voice.real.wake.enabled=true),再运行本脚本。
-测试超时前请把 config voice.real.wake.timeout_seconds 临时调小(如 8),测完恢复 60。
+测试超时前请把 config voice.real.wake.timeout_seconds 临时调小(如 8),测完恢复 600。
 """
 import asyncio
 import json
@@ -151,8 +151,8 @@ async def main():
           f"seq={seq2} pcm={pcm2}")
     t2b, _ = await collect_until(ws, "MIC_START", 8.0, "phase2b")
     seq2b = [t for _, t in t2b]
-    check("P2b 持续对话: SPKE 后收到 MIC_START(无需重新说唤醒词)",
-          bool(seq2b) and seq2b[-1] == "MIC_START",
+    check("P2b 非唤醒说完成不主动续听: SPKE 后 8s 内无 MIC_START(检测到下一轮语音输入才发)",
+          "MIC_START" not in seq2b,
           f"seq={seq2b}")
 
     # ---- P5r 真实回声免疫:播放期把下行 PCM 降采样回传(模拟扬声器→麦克风),
@@ -189,7 +189,7 @@ async def main():
     await collect_until(ws, "MIC_START", 8.0, "phase6d")
 
     # ---- 阶段3: 静默停传 > timeout(8s),引擎应回待机 ----
-    timeout_s = float(cfg.get("voice", {}).get("real", {}).get("wake", {}).get("timeout_seconds", 60))
+    timeout_s = float(cfg.get("voice", {}).get("real", {}).get("wake", {}).get("timeout_seconds", 600))
     print(f"[phase3] 静默 {timeout_s + 3:.0f}s(等待空闲超时)", flush=True)
     await asyncio.sleep(timeout_s + 3.0)
     # 无下行可观测(超时回待机不发命令),从阶段4 的"二次唤醒"验证

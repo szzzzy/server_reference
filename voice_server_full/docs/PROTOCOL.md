@@ -225,8 +225,11 @@ mic_started | mic_stopped | mic_wake | mic_sleep | volume_set
 4. **线上唤醒**（新版固件：无本地唤醒词）：设备 WSS 认证后**持续上传 PCM1** → 服务器待机态
    用普通 ASR 判定"你好小科"（含同音容错）→ 下发 MIC_START（设备→LISTEN，UI 闭眼）；
    服务器 VAD 判说完 → MIC_STOP（结束本轮 LISTEN，不关 PCM）→ ASR/LLM/TTS 下行
-   （SPKS→PCM→SPKE，设备播完回 IDLE，PCM 继续上传）→ 服务器**自动续听**（SPKE→MIC_START，
-   持续对话，无需重复唤醒词）→ 空闲超时（60s 无交互）回待机。
+   （SPKS→PCM→SPKE，设备播完回 IDLE，PCM 继续上传）→ **非唤醒说完成不主动续听**：
+   设备回 IDLE；服务器检测到下一轮合法语音起始才发 MIC_START（设备→LISTEN，无需重复唤醒词）
+   → 空闲超时（600s 无交互）回待机；
+   设备断开（掉 WiFi/重启）→ 服务器立即终止会话回待机并清 RingBuffer/历史，
+   重连后必须重新说唤醒词。
 4.1 **播放期打断**（服务器侧，2026-08-31）：播放中服务器判定用户抢话（语义回放免疫：识别
    内容与播放文本相似度低且 ≥2 字）→ 停止下发旧 TTS + SPKE + MIC_START → 固件立即停止
    扬声器（EVT_INTERRUPT）直接进入 LISTEN；未经 AEC，v1 不保留用户插话全文。

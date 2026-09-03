@@ -130,22 +130,22 @@ SPKE+MIC_START);动态底噪自适应阈值(默认开)。设计书:`语音工作
 ### 关键机制
 
 - **字节流兼容层 RingBuffer**:实现 serial 同形接口(read/reset_input_buffer/flush),并**在语音停流后自动补合成静音帧(默认 1.4 s,按 endpoint_ms 配置)**,使现有 `capture_until_endpoint` 的尾部静音端点逻辑照常生效(这是 WSS"推送帧"与串口"持续流"适配的关键);
-- **会话形态(默认配置)**:线上唤醒"你好小科"(服务器流式 ASR + 同音容错,见 `voice.real.wake`)+ **唤醒一次·持续对话**(SPKE 后自动 MIC_START,60s 空闲超时回待机);
-- **播放期**:半双工(不回采扬声器回声)+ **语义回放免疫打断**(识别内容 ≠ 播放文本 → 提前 SPKE+MIC_START,见 `voice.real.interrupt`);无 AEC,打断不保留用户插话全文(v1);
+- **会话形态(默认配置)**:线上唤醒"你好小科"(服务器流式 ASR + 同音容错,见 `voice.real.wake`)+ **唤醒一次·持续对话**(**非唤醒说完成不主动 MIC_START**:设备回 IDLE,检测到下一轮合法语音起始才发(`on_start` 回调);600s 空闲超时回待机;唤醒应答除外);**设备断联立即终止会话回待机**(清 RingBuffer 与 LLM 历史),重连后必须重新说唤醒词;
+- **播放期**:半双工(不回采扬声器回声,回声归丢弃路径)+ **语义回放免疫打断 v2·接住**(识别内容 ≠ 播放文本 → 提前 SPKE,插话文本直接作答后 MIC_START,见 `voice.real.interrupt`);无 AEC,插话音频混有回声(文本可用);
 - **动态底噪**:`voice.real.vad.dynamic_floor`(默认开,双窗自适应阈值,启用时跳过开机静态校准);
 - **分句**:重建版 `_sentence_chunks`(原版含面向控制台的 print,在 GBK 控制台遇 emoji 会崩溃 → 不能直接复用,按规则重建,逻辑一致);
 - **并发**:WSS 异步收发;采集/ASR/Qwen/TTS 顺序在 GPU 上串行(与现状一致);下行经 `call_soon_threadsafe` 调度到事件循环广播。
 
 ### 已知边界
 
-- 客户端断开后:下行帧被丢弃(合成继续,属正常);
-- 播放期间用户不能抢话的同时保留全句(v1 丢弃插话前半句;v2 拼接/AEC);
+- 客户端断开后:下行帧被丢弃(合成继续,属正常);引擎会话立即终止回待机(重连需重新唤醒);
+- 播放期间用户抢话:文本被接住直接作答(v2),插话音频仍混有回声(需 AEC 才能信号级分离);
 - 板卡上传模式:新版固件认证后持续上传(MICS 被忽略);旧固件 MICS 触发/MICW 持续两模式仍兼容。
 
 ### 与新版 PROTOCOL.md(设备侧实际实现)的一致性
 
 - **权威协议参考**:项目根 `PROTOCOL.md`(julia-fused-base 实际实现);
-- **线上唤醒**:设备无本地唤醒词 → 服务器判"你好小科"→ MIC_START(设备 LISTEN);MIC_STOP 只结束本轮 LISTEN 不关 PCM;播放期打断 = 服务器停止旧 TTS + MIC_START(设备 EVT_INTERRUPT 进 LISTEN);
+- **线上唤醒**:设备无本地唤醒词 → 服务器判"你好小科"→ MIC_START(设备 LISTEN);MIC_STOP 只结束本轮 LISTEN 不关 PCM;非唤醒说完成不主动续听(检测到下一轮合法语音起始才发 MIC_START),播放期打断 = 服务器停止旧 TTS +(无插话文本时)不主动续听;
 - **vcmd(MQTT)命令集**:`FILE_SEND/MIC_START/MIC_STOP/MICW/MICS/SPKV`——**不含 SPKS/SPKE/SPKT**(那些只走 WSS 下行);服务器默认只在 WSS 发语音命令,无冲突;
 - **固件镜像头**:`make_test_artifacts.py` 生成的 app.bin 带 `project_name=julia-ai`(PROTOCOL.md §3.5 要求);
 - 协议自测断言全过(OTA 7/7、Audio 16/16、Voice 7/7 实测)。

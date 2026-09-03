@@ -25,13 +25,19 @@ from voice_bridge import make_engine
 log = logging.getLogger("vs.main")
 
 
-def build_status_fn(hub, engine):
+def build_status_fn(hub, engine, wss=None):
     def _status():
         out = {
             "hub": hub.snapshot(),
             "engine": engine.snapshot(),
             "recent": hub.recent_list(60),
         }
+        if wss is not None:
+            out["wss"] = {
+                "clients": len(getattr(wss, "clients", {})),
+                "disconnects": getattr(wss, "_disconnects", 0),
+                "stall_remaining_s": wss.stall_remaining(),
+            }
         try:
             out["manifest"] = json.loads(
                 (HERE / "releases/manifest.json").read_text(encoding="utf-8")
@@ -56,7 +62,20 @@ async def amain(args, cfg, run_dir):
     broker_task = None
     if cfg.get("mqtt", {}).get("enable_local_broker", True) and not args.no_broker:
         from broker import run_broker
-        broker_task = asyncio.create_task(run_broker(cfg.get("mqtt", {}), stop_event))
+
+        # 设备(MQTT esp*)重连 = 设备重启(旧 WSS 连接可能在服务器侧残留) →
+        # 引擎会话重置为待机(重连后需重新唤醒),与 WSS 0→1/1→0 边界语义互补
+        def _on_device_connect(client_id, clean):
+            on_conn = getattr(engine, "on_client_connected", None)
+            if on_conn is not None:
+                try:
+                    on_conn(f"mqtt:{client_id}")
+                    log.info("MQTT 设备重启检测: %s → 引擎会话重置为待机(需重新唤醒)", client_id)
+                except Exception as e:
+                    log.warning("MQTT 设备重启回调失败: %s", e)
+
+        broker_task = asyncio.create_task(
+            run_broker(cfg.get("mqtt", {}), stop_event, _on_device_connect))
 
     # ---------- 2) HTTPS 文件服务(线程) ----------
     import ssl as _ssl
@@ -78,6 +97,9 @@ async def amain(args, cfg, run_dir):
     from wss_adapter import WssAdapter
     wss = WssAdapter(cfg, hub, engine, run_dir)
     await wss.start()
+    # 注压测试接口(2026-09-03): HTTPS 端点 /__stall?sec=N → wss.stall(N)
+    file_server.stall_fn = wss.stall
+    file_server.status_fn = build_status_fn(hub, engine, wss)
 
     # 引擎下行 sink:从工作线程安全调度到事件循环,广播给在线 WSS 客户端
     if hasattr(engine, "set_sink"):
@@ -111,9 +133,26 @@ async def amain(args, cfg, run_dir):
             engine.mqtt = mqtt
 
     # ---------- 5) 管理通道:stdin 控制台 + 一次性 vcmd ----------
+    def _try_wait_command(text):
+        """注压测试命令 'wait <秒>'(如 wait 3 / wait 50 / wait 0 取消)。
+        命中返回 True(不再作为设备 vcmd 下发)。"""
+        line = (text or "").strip()
+        m = line.lower().split()
+        if len(m) >= 2 and m[0] == "wait":
+            try:
+                secs = float(m[1])
+            except ValueError:
+                log.warning("wait 参数须为秒数,如: wait 3 / wait 50 / wait 0(取消)")
+                return True
+            wss.stall(secs)
+            return True
+        return False
+
     async def console():
         log.info("console 启动(admin_vcmd=%r)", args.admin_vcmd[:40] if args.admin_vcmd else "")
         if args.admin_vcmd:
+            if _try_wait_command(args.admin_vcmd):
+                return
             if mqtt is None:
                 log.warning("MQTT 控制面已禁用,--admin-vcmd 未送达")
                 return
@@ -133,10 +172,13 @@ async def amain(args, cfg, run_dir):
             if not line:
                 break
             line = line.strip()
-            if line:
-                if mqtt is not None:
-                    mqtt.send_vcmd(line)
-                await wss.broadcast_text(line)
+            if not line:
+                continue
+            if _try_wait_command(line):
+                continue
+            if mqtt is not None:
+                mqtt.send_vcmd(line)
+            await wss.broadcast_text(line)
 
     asyncio.create_task(console())
 
